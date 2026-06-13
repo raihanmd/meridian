@@ -433,3 +433,32 @@ When scheduling work, follow the **`_busy` flag + cooldown** pattern. `_manageme
 - Changing deploy/close behavior → `tools/dlmm.js` (the SDK wrapper) and `tools/executor.js` (the post-tool side effects + Telegram notify + auto-swap).
 - Discord listener issues → `discord-listener/pre-checks.js`.
 - HiveMind protocol issues → `hivemind.js` (push side) and `lessons.js#getLessonsForPrompt` (pull side injection).
+
+---
+
+## Research Documentation
+
+### Meteora DLMM Integration in Meridian
+
+For a comprehensive understanding of how Meridian discovers, evaluates, and deploys to Meteora DLMM pools, see:
+
+**`docs/research/meteora-dlmm-in-meridian.md`**
+
+This document covers:
+- Pool Discovery API integration (`https://pool-discovery-api.datapi.meteora.ag`)
+- DLMM SDK usage (`@meteora-ag/dlmm`)
+- Multi-stage pipeline: hard filters → scoring → LLM reasoning → on-chain execution
+- Pool evaluation criteria (TVL, fee/TVL, volume, holders, mcap, bin_step, volatility, organic scores)
+- Scoring formula: `fee_tvl * 1000 + organic * 10 + volume/100 + holders/100`
+- PVP (Peer Volume Protection) detection for conflicting symbols
+- Active bin & price concepts
+- Bin step bounds (80-125)
+- Fee/TVL ratio as key yield metric
+- LLM reasoning instructions in SCREENER and MANAGER roles
+- Performance lessons (PREFER/AVOID/WORKED/FAILED)
+- Signal weights (Darwinian, recalculated every 5 closes)
+- Pool memory with cooldown tracking
+- Position lifecycle (deploy → manage → close)
+- Integration points for extending the system (e.g., Sharia Advisor)
+
+**Key findings:** Meridian is execution-capable (not just recommendations), uses sophisticated multi-stage filtering with LLM judgment, and has mature reasoning infrastructure (lessons, signal weights, pool memory) that can be extended for additional criteria.
