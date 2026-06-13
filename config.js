@@ -95,6 +95,7 @@ export const config = {
     { baseMint: "cbbtcf3aa214zXHbiAZQwf4122FBYbraNdFqgw4iMij", quoteMint: "So11111111111111111111111111111111111111112" },
     { baseMint: "cbbtcf3aa214zXHbiAZQwf4122FBYbraNdFqgw4iMij", quoteMint: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v" },
     { baseMint: "cbbtcf3aa214zXHbiAZQwf4122FBYbraNdFqgw4iMij", quoteMint: "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB" },
+    { baseMint: "BBKPiLM9KjdJW7oQSKt99RVWcZdhF6sEHRKnwqeBGHST", quoteMint: "So11111111111111111111111111111111111111112" },
   ],     // [{baseMint, quoteMint}] — order-insensitive
     shariaManualApprovalTimeoutMinutes: u.shariaManualApprovalTimeoutMinutes ?? 30,
     restrictAdd: u.restrictAdd !== undefined ? u.restrictAdd : true,
