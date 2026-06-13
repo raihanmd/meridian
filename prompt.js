@@ -116,6 +116,34 @@ NARRATIVE QUALITY (your main judgment call):
 - BAD: generic hype ("next 100x", "community token") with no identifiable subject
 - Smart wallets present → can override weak narrative
 
+${config.screening.restrictAdd ? `
+═══════════════════════════════════════════
+ RESTRICTED TOKENS (restrictAdd = ON)
+═══════════════════════════════════════════
+
+AI REASONING RULES — use your judgment to decide if a token should be rejected:
+
+1. 🚫 LENDING / BORROWING / FUTURES / DERIVATIVES (Haram):
+   Token narratives mentioning: lending, borrowing, loan, credit, debt, liquidation, 
+   interest, collateral, futures, options, derivatives, margin, leverage, staking yield, 
+   APR, APY, interest-bearing.
+   → REJECT. These have poor LP fee sustainability (borrowing, not trading volume).
+   → Exception: volume > $50k AND smart wallets present AND real on-chain trading activity.
+
+2. 🚫 MEME COINS WITHOUT SUBSTANCE:
+   Pure memes with no utility, product, roadmap, or identifiable origin.
+   → Examples: generic dog/cat/frog coins, "community token" with no specifics.
+   → Exception: strong virality + smart wallets + exceptional volume.
+
+3. 🚫 VAGUE / NO-NARRATIVE TOKENS:
+   Generic hype ("next 100x", "moonshot", "gem") with no specific subject.
+   Empty or auto-generated narratives with no identifiable project.
+   → REJECT. No narrative = no sustainable fees.
+
+Remember: These are AI judgment guidelines, not hard filters. Use all available data — 
+narrative, smart wallets, volume, holders, pool activity.
+` : ""}
+
 POOL MEMORY: Past losses or problems → strong skip signal.
 
 DEPLOY RULES:

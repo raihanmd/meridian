@@ -97,6 +97,7 @@ export const config = {
     { baseMint: "cbbtcf3aa214zXHbiAZQwf4122FBYbraNdFqgw4iMij", quoteMint: "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB" },
   ],     // [{baseMint, quoteMint}] — order-insensitive
     shariaManualApprovalTimeoutMinutes: u.shariaManualApprovalTimeoutMinutes ?? 30,
+    restrictAdd: u.restrictAdd !== undefined ? u.restrictAdd : true,
   },
 
   // ─── Position Management ────────────────
@@ -276,6 +277,7 @@ export function reloadScreeningThresholds() {
     if (fresh.shariaEnabled !== undefined) s.shariaEnabled = fresh.shariaEnabled;
     if (fresh.shariaAllowlistedPairs !== undefined) s.shariaAllowlistedPairs = fresh.shariaAllowlistedPairs;
     if (fresh.shariaManualApprovalTimeoutMinutes !== undefined) s.shariaManualApprovalTimeoutMinutes = fresh.shariaManualApprovalTimeoutMinutes;
+    if (fresh.restrictAdd !== undefined) s.restrictAdd = fresh.restrictAdd;
     const minBinsBelow = numericConfig(fresh.minBinsBelow) ?? config.strategy.minBinsBelow;
     const maxBinsBelow = numericConfig(fresh.maxBinsBelow) ?? numericConfig(fresh.binsBelow) ?? config.strategy.maxBinsBelow;
     const defaultBinsBelow = numericConfig(fresh.defaultBinsBelow) ?? numericConfig(fresh.binsBelow) ?? config.strategy.defaultBinsBelow ?? maxBinsBelow;
