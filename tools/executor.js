@@ -1,3 +1,6 @@
+let _shariaApprovalBypass = false;
+export function setShariaApprovalBypass(val) { _shariaApprovalBypass = val; }
+
 import { discoverPools, getPoolDetail, getTopCandidates } from "./screening.js";
 import {
   getActiveBin,
@@ -92,6 +95,25 @@ async function validateDeployPoolThresholds(args) {
     };
   }
 
+  if (detail?.pool_type !== "dlmm") {
+    return {
+      pass: false,
+      reason: `Pool type ${detail?.pool_type ?? "unknown"} is not dlmm. Only Meteora DLMM pools are allowed.`,
+    };
+  }
+  if (!detail?.dlmm_params) {
+    return {
+      pass: false,
+      reason: "Pool is missing dlmm_params. Only Meteora DLMM pools are allowed.",
+    };
+  }
+  if (detail?.damm_v2_params) {
+    return {
+      pass: false,
+      reason: "DAMM v2 pool is not allowed. Only Meteora DLMM pools are allowed.",
+    };
+  }
+
   const tvl = poolDetailTvl(detail);
   const minTvl = numberOrNull(config.screening.minTvl);
   const maxTvl = numberOrNull(config.screening.maxTvl);
@@ -165,6 +187,24 @@ async function validateDeployPoolThresholds(args) {
   }
 
   const baseMint = detail?.token_x?.address || detail?.base_token_address || null;
+  const quoteMint = detail?.token_y?.address || detail?.quote_token_address || null;
+
+  // Sharia approval check — block non-allowlisted pairs when sharia is enabled
+  if (config.screening.shariaEnabled && !_shariaApprovalBypass) {
+    const allowlisted = config.screening.shariaAllowlistedPairs?.some(pair => {
+      const a = pair.baseMint || pair.base_mint;
+      const b = pair.quoteMint || pair.quote_mint;
+      if (!a || !b || !baseMint || !quoteMint) return false;
+      return (baseMint === a && quoteMint === b) || (baseMint === b && quoteMint === a);
+    });
+    if (!allowlisted) {
+      return {
+        pass: false,
+        reason: `Pool pair not in sharia allowlist. Manual approval required before deploy.`,
+      };
+    }
+  }
+
   const entryMarketData = {
     entry_mcap: numberOrNull(detail?.token_x?.market_cap ?? detail?.base_token_market_cap),
     entry_tvl: tvl,
@@ -615,6 +655,7 @@ export async function executeTool(name, args) {
       if (name === "swap_token" && result.tx) {
         notifySwap({ inputSymbol: args.input_mint?.slice(0, 8), outputSymbol: args.output_mint === "So11111111111111111111111111111111111111112" || args.output_mint === "SOL" ? "SOL" : args.output_mint?.slice(0, 8), amountIn: result.amount_in, amountOut: result.amount_out, tx: result.tx }).catch(() => {});
       } else if (name === "deploy_position") {
+        if (_shariaApprovalBypass) { _shariaApprovalBypass = false; }
         notifyDeploy({ pair: result.pool_name || args.pool_name || args.pool_address?.slice(0, 8), amountSol: args.amount_y ?? args.amount_sol ?? 0, position: result.position, tx: result.txs?.[0] ?? result.tx, priceRange: result.price_range, rangeCoverage: result.range_coverage, binStep: result.bin_step, baseFee: result.base_fee }).catch(() => {});
       } else if (name === "close_position") {
         notifyClose({ pair: result.pool_name || args.position_address?.slice(0, 8), pnlUsd: result.pnl_usd ?? 0, pnlPct: result.pnl_pct ?? 0 }).catch(() => {});
@@ -656,6 +697,7 @@ export async function executeTool(name, args) {
 
     return result;
   } catch (error) {
+    if (_shariaApprovalBypass) _shariaApprovalBypass = false;
     const duration = Date.now() - startTime;
 
     logAction({
@@ -666,7 +708,6 @@ export async function executeTool(name, args) {
       success: false,
     });
 
-    // Return error to LLM so it can decide what to do
     return {
       error: error.message,
       tool: name,
