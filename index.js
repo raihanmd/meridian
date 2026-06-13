@@ -31,6 +31,7 @@ import { recordPositionSnapshot, recallForPool, addPoolNote } from "./pool-memor
 import { checkSmartWalletsOnPool } from "./smart-wallets.js";
 import { getTokenNarrative, getTokenInfo } from "./tools/token.js";
 import { stageSignals } from "./signal-tracker.js";
+import { stagePendingApproval, resolvePendingApproval, hasPendingApproval, getPendingApprovalSummary, getPendingApprovals } from "./pending-approval.js";
 import { getWeightsSummary } from "./signal-weights.js";
 import { bootstrapHiveMind, ensureAgentId, getHiveMindPullMode, isHiveMindEnabled, pullHiveMindLessons, pullHiveMindPresets, registerHiveMindAgent, startHiveMindBackgroundSync } from "./hivemind.js";
 import { appendDecision } from "./decision-log.js";
@@ -448,7 +449,24 @@ export async function runScreeningCycle({ silent = false } = {}) {
     // Fetch top candidates, then recon each sequentially with a small delay to avoid 429s
     const topCandidates = await getTopCandidates({ limit: 10 }).catch(() => null);
     const candidates = (topCandidates?.candidates || topCandidates?.pools || []).slice(0, 10);
+    const pendingCandidates = (topCandidates?.pending_candidates || []).slice(0, 5);
     const earlyFilteredExamples = topCandidates?.filtered_examples || [];
+
+    if (config.screening.shariaEnabled && pendingCandidates.length > 0 && !hasPendingApproval()) {
+      const best = pendingCandidates[0];
+      stagePendingApproval(best.pool || best.pool_address, {
+        pool_name: best.name,
+        pool_address: best.pool,
+        deploy_amount: deployAmount,
+        bins_below: config.strategy.defaultBinsBelow,
+        volatility: best.volatility,
+        reason: best.sharia_notes || "sharia: pair not in allowlist",
+      });
+      // Cache pending candidate so /approve can find it
+      _pendingCandidatesCache = [best, ...pendingCandidates.slice(1)];
+      _latestCandidates = [...candidates, best, ...pendingCandidates.slice(1)];
+      _latestCandidatesAt = Date.now();
+    }
 
     const allCandidates = [];
     for (const pool of candidates) {
@@ -561,7 +579,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
 
       const block = [
         `POOL: ${pool.name} (${pool.pool})`,
-        `  metrics: bin_step=${pool.bin_step}, fee_pct=${pool.fee_pct}%, fee_tvl=${pool.fee_active_tvl_ratio}, vol=$${pool.volume_window}, tvl=$${pool.tvl ?? pool.active_tvl}, volatility_${pool.volatility_timeframe || "30m"}=${pool.volatility}, mcap=$${pool.mcap}, organic=${pool.organic_score}${pool.token_age_hours != null ? `, age=${pool.token_age_hours}h` : ""}`,
+        `  metrics: bin_step=${pool.bin_step}, fee_pct=${pool.fee_pct}%, fee_tvl=${pool.fee_active_tvl_ratio}, vol=$${pool.volume_window}, tvl=$${pool.tvl ?? pool.active_tvl}, volatility_${pool.volatility_timeframe || "30m"}=${pool.volatility}, mcap=$${pool.mcap}, organic=${pool.organic_score}${pool.token_age_hours != null ? `, age=${pool.token_age_hours}h` : ""}${pool.sharia_score != null ? `, sharia=${pool.sharia_score}` : ""}${pool.sharia_source && pool.sharia_source !== "disabled" ? `, sharia:${pool.sharia_source}` : ""}${pool.sharia_manual_approval_required ? `, ⚠️manual_approval` : ""}`,
         `  audit: top10=${top10Pct}%, bots=${botPct}%, fees=${feesSol}SOL${launchpad ? `, launchpad=${launchpad}` : ""}`,
         pvpLine,
         `  smart_wallets: ${sw?.in_pool?.length ?? 0} present${sw?.in_pool?.length ? ` → CONFIDENCE BOOST (${sw.in_pool.map(w => w.name).join(", ")})` : ""}`,
@@ -673,6 +691,11 @@ IMPORTANT:
         },
       });
     screenReport = content;
+    const pending = getPendingApprovalSummary();
+    if (pending) {
+      const expiryMin = Math.max(1, Math.ceil((pending.expires_at - Date.now()) / 60_000));
+      screenReport += `\n\n⚠️ PENDING APPROVAL\n${pending.pool_name}\nPool: ${pending.pool_address}\nPending: ${expiryMin}m left\n\nREPL: /approve to deploy | /decline to skip\nTelegram: tap Approve / Decline below`;
+    }
     if (/⛔\s*NO DEPLOY/i.test(content)) {
       appendDecision({
         type: "no_deploy",
@@ -697,6 +720,19 @@ IMPORTANT:
       if (screenReport) {
         if (liveMessage) await liveMessage.finalize(stripThink(screenReport)).catch(() => {});
         else sendMessage(`🔍 Screening Cycle\n\n${stripThink(screenReport)}`).catch(() => { });
+      }
+      const pending = getPendingApprovalSummary();
+      if (pending) {
+        const expiryMin = Math.max(1, Math.ceil((pending.expires_at - Date.now()) / 60_000));
+        await sendMessageWithButtons(
+          `⚠️ PENDING APPROVAL\n${pending.pool_name}\nPool: ${pending.pool_address?.slice(0, 8)}...\nExpires in ${expiryMin}m`,
+          [
+            [
+              { text: "Approve", callback_data: "approval:approve:0" },
+              { text: "Decline", callback_data: "approval:decline:0" },
+            ],
+          ]
+        ).catch(() => {});
       }
     }
   }
@@ -925,6 +961,7 @@ const MAX_HISTORY = 20;    // keep last 20 messages (10 exchanges)
 let _ttyInterface = null;
 let _latestCandidates = [];
 let _latestCandidatesAt = null;
+let _pendingCandidatesCache = [];
 
 function setLatestCandidates(candidates = []) {
   _latestCandidates = Array.isArray(candidates) ? candidates : [];
@@ -965,6 +1002,22 @@ function formatWalletStatus(wallet, positions) {
   ].join("\n");
 }
 
+function formatShariaPairAllowlist() {
+  const labels = new Map([
+    ["So11111111111111111111111111111111111111112", "SOL"],
+    ["EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", "USDC"],
+    ["Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB", "USDT"],
+    ["cbbtcf3aa214zXHbiAZQwf4122FBYbraNdFqgw4iMij", "cbBTC"],
+  ]);
+  const pairs = config.screening.shariaAllowlistedPairs || [];
+  if (!pairs.length) return "none";
+  return pairs.map(pair => {
+    const base = pair.baseMint || pair.base_mint;
+    const quote = pair.quoteMint || pair.quote_mint;
+    return `${labels.get(base) || base?.slice(0, 6)}/${labels.get(quote) || quote?.slice(0, 6)}`;
+  }).join(", ");
+}
+
 function formatConfigSnapshot() {
   return [
     "Config snapshot",
@@ -977,6 +1030,7 @@ function formatConfigSnapshot() {
     `Repeat deploy cooldown: ${config.management.repeatDeployCooldownEnabled ? "on" : "off"} | ${config.management.repeatDeployCooldownTriggerCount}x / ${config.management.repeatDeployCooldownHours}h | min fee earned ${config.management.repeatDeployCooldownMinFeeEarnedPct}% | ${config.management.repeatDeployCooldownScope}`,
     `Yield floor: ${config.management.minFeePerTvl24h}% | min age ${config.management.minAgeBeforeYieldCheck}m`,
     `Screening: ${config.screening.category} / ${config.screening.timeframe} | TVL ${config.screening.minTvl}-${config.screening.maxTvl}`,
+    `Sharia: ${config.screening.shariaEnabled ? "on" : "off"} | allowlist [${formatShariaPairAllowlist()}] | timeout ${config.screening.shariaManualApprovalTimeoutMinutes}m`,
     `Intervals: manage ${config.schedule.managementIntervalMin}m | screen ${config.schedule.screeningIntervalMin}m`,
     `HiveMind: ${isHiveMindEnabled() ? "enabled" : "disabled"}${config.hiveMind.agentId ? ` | ${config.hiveMind.agentId}` : ""}`,
   ].join("\n");
@@ -1235,6 +1289,46 @@ async function applySettingsMenuCallback(msg) {
   await showSettingsMenu({ messageId: msg.messageId, page });
 }
 
+async function applyApprovalCallback(msg) {
+  const parts = (msg.callbackData || "").split(":");
+  const action = parts[1];
+  if (action === "noop") {
+    await answerCallbackQuery(msg.callbackQueryId);
+    return;
+  }
+  const pending = getPendingApprovalSummary();
+  if (!pending) {
+    await answerCallbackQuery(msg.callbackQueryId, "No pending approval.");
+    await editMessage("⚠️ No pending approval found.", msg.messageId);
+    return;
+  }
+  if (action === "approve") {
+    await answerCallbackQuery(msg.callbackQueryId, "Deploying...");
+    await editMessage(`Deploying ${pending.pool_name}...`, msg.messageId);
+    const candidateIndex = _latestCandidates.findIndex(c => (c.pool || c.pool_address) === (pending.pool_address || pending.id));
+    if (candidateIndex < 0) {
+      await editMessage(`❌ Candidate not in cache. Run /candidates or /screen first.`, msg.messageId);
+      resolvePendingApproval(pending.id, "declined");
+      return;
+    }
+    try {
+      await deployPendingCandidate(candidateIndex);
+      await editMessage(`✅ Deployed ${pending.pool_name}`, msg.messageId);
+    } catch (e) {
+      await editMessage(`❌ Deploy failed: ${e.message}`, msg.messageId);
+      resolvePendingApproval(pending.id, "declined");
+    }
+    return;
+  }
+  if (action === "decline") {
+    await answerCallbackQuery(msg.callbackQueryId, "Declined");
+    await editMessage(`Declined ${pending.pool_name}`, msg.messageId);
+    resolvePendingApproval(pending.id, "declined");
+    return;
+  }
+  await answerCallbackQuery(msg.callbackQueryId);
+}
+
 function formatHelpText() {
   return [
     "Telegram commands",
@@ -1280,6 +1374,20 @@ async function runDeterministicScreen(limit = 5) {
   return examples
     ? `No candidates available.\nFiltered examples:\n${examples}`
     : "No candidates available right now.";
+}
+
+async function deployPendingCandidate(index) {
+  const pending = getPendingApprovalSummary();
+  if (!pending) throw new Error("No pending approval.");
+  const { setShariaApprovalBypass } = await import("./tools/executor.js");
+  setShariaApprovalBypass(true);
+  try {
+    const result = await deployLatestCandidate(index);
+    resolvePendingApproval(pending.id, "approved");
+    return result;
+  } finally {
+    setShariaApprovalBypass(false);
+  }
 }
 
 async function deployLatestCandidate(index) {
@@ -1369,8 +1477,30 @@ async function telegramHandler(msg) {
     }
     return;
   }
+  if (msg?.isCallback && text.startsWith("approval:")) {
+    try {
+      await applyApprovalCallback(msg);
+    } catch (e) {
+      await answerCallbackQuery(msg.callbackQueryId, e.message).catch(() => {});
+    }
+    return;
+  }
   if (text === "/settings" || text === "/menu" || text === "/configmenu") {
     await showSettingsMenu().catch((e) => sendMessage(`Settings error: ${e.message}`).catch(() => {}));
+    return;
+  }
+  if (text === "/pending") {
+    const pending = getPendingApprovals();
+    if (!pending.length) {
+      await sendMessage("No pending approvals.").catch(() => {});
+    } else {
+      const lines = pending.map((p, i) => {
+        const expiryMin = Math.max(0, Math.ceil((p.expires_at - Date.now()) / 60_000));
+        const status = expiryMin <= 0 ? "⚠️ EXPIRED" : `⏱ expires in ${expiryMin}m`;
+        return `${i + 1}. ${p.pool_name}\n   ${p.pool_address?.slice(0, 8)}... | ${status}`;
+      });
+      await sendMessage(`Pending sharia approvals:\n\n${lines.join("\n\n")}\n\nTap the buttons below to Approve or Decline.`).catch(() => {});
+    }
     return;
   }
   if (_managementBusy || _screeningBusy || busy) {
@@ -1961,6 +2091,57 @@ Focus on: hold duration, entry/exit timing, what win rates look like, whether sc
           console.log("\nSaved to user-config.json. Applied immediately.\n");
         }
       });
+      return;
+    }
+
+    if (input === "/pending") {
+      await runBusy(async () => {
+        const pending = getPendingApprovals();
+        if (!pending.length) {
+          console.log("\nNo pending approvals.\n");
+        } else {
+          console.log("\nPending approvals:\n");
+          pending.forEach((p, i) => {
+            const expiryMin = Math.max(0, Math.ceil((p.expires_at - Date.now()) / 60_000));
+            const status = expiryMin <= 0 ? "EXPIRED" : `expires in ${expiryMin}m`;
+            console.log(`  ${i + 1}. ${p.pool_name} | ${p.pool_address?.slice(0, 8)}... | ${status}`);
+          });
+          console.log("\n/approve <n> to deploy | /decline <n> to skip\n");
+        }
+      });
+      return;
+    }
+
+    const approveMatch = input.match(/^\/approve\s*(\d+)?$/i);
+    if (approveMatch) {
+      const pending = getPendingApprovals();
+      if (!pending.length) { console.log("\nNo pending approvals.\n"); return; }
+      const idx = approveMatch[1] ? parseInt(approveMatch[1]) - 1 : pending.length - 1;
+      if (idx < 0 || idx >= pending.length) { console.log(`\nInvalid number. Use 1-${pending.length}.\n`); return; }
+      await runBusy(async () => {
+        const p = pending[idx];
+        const candidateIndex = _latestCandidates.findIndex(c => (c.pool || c.pool_address) === (p.pool_address || p.id));
+        if (candidateIndex < 0) { console.log(`\nCandidate not in cache. Run /candidates first.\n`); return; }
+        console.log(`\nDeploying ${p.pool_name}...\n`);
+        try {
+          const { result } = await deployPendingCandidate(candidateIndex);
+          console.log(`\n✅ Deployed ${p.pool_name}\n`);
+        } catch (e) {
+          console.log(`\n❌ Deploy failed: ${e.message}\n`);
+        }
+      });
+      return;
+    }
+
+    const declineMatch = input.match(/^\/decline\s*(\d+)?$/i);
+    if (declineMatch) {
+      const pending = getPendingApprovals();
+      if (!pending.length) { console.log("\nNo pending approvals.\n"); return; }
+      const idx = declineMatch[1] ? parseInt(declineMatch[1]) - 1 : pending.length - 1;
+      if (idx < 0 || idx >= pending.length) { console.log(`\nInvalid number. Use 1-${pending.length}.\n`); return; }
+      const p = pending[idx];
+      resolvePendingApproval(p.id, "declined");
+      console.log(`\nDeclined ${p.pool_name}\n`);
       return;
     }
 
