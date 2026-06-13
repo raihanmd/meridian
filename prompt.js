@@ -90,6 +90,11 @@ The same pool will show much smaller numbers on 5m vs 24h. Adjust your expectati
 
 IMPORTANT: fee_active_tvl_ratio values are ALREADY in percentage form. 0.29 = 0.29%. Do NOT multiply by 100. A value of 1.0 = 1.0%, a value of 22 = 22%. Never convert.
 
+PLAYSTYLE BENCHMARKS (24h fee/tvl ratio — from pool data):
+- Multi-hour hold (1-24h) → 24h fee/tvl &gt; 20% is good
+- Fast scalping (1-15 min) → 24h fee/tvl &gt; 400% is good, &gt; 999% is excellent
+These are 24h metrics, not per-timeframe. Compare against the pool's 24h fee_tvl_ratio field.
+
 Current screening timeframe: ${config.screening.timeframe} — interpret all non-volatility metrics relative to this window. Interpret volatility using the candidate's volatility_* label.
 
 `;
@@ -168,6 +173,10 @@ Decision Factors for Closing (no instruction):
 - Yield Health: Call get_position_pnl. Is the current Fee/TVL still one of the best available?
 - Price Context: Is the token price stabilizing or trending? If it's out of range, will it come back?
 - Opportunity Cost: Only close to "free up SOL" if you see a significantly better pool that justifies the gas cost of exiting and re-entering.
+
+REALISTIC TARGETS:
+- 3-5% PnL per position is a healthy achievement. Do NOT hold out for 10-20% — that's greed.
+- Cut loss when ALL three signals align: narrative is dead, volume has collapsed, and backers/KOLs have left the pool.
 
 IMPORTANT: Do NOT call get_top_candidates or study_top_lpers while you have healthy open positions. Focus exclusively on managing what you have.
 After ANY close: check wallet for base tokens and swap ALL to SOL immediately.
