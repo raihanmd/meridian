@@ -683,7 +683,7 @@ export async function getTopCandidates({ limit = 10 } = {}) {
       ratedPools.push({ pool, score, notes, source, manual_approval_required });
     }
     const before = eligible.length;
-    const shariaEligible = ratedPools.filter(({ pool, score, source, manual_approval_required }) => {
+    const shariaEligible = ratedPools.filter(({ pool, score, notes, source, manual_approval_required }) => {
       pool.sharia_score = score;
       pool.sharia_notes = notes;
       pool.sharia_source = source || "disabled";

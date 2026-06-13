@@ -1329,30 +1329,49 @@ async function applyApprovalCallback(msg) {
   await answerCallbackQuery(msg.callbackQueryId);
 }
 
-function formatHelpText() {
-  return [
-    "Telegram commands",
-    "",
-    "/help — show commands",
+function formatHelpText(surface = "Telegram") {
+  const common = [
+    "/help — show this command list",
     "/status — wallet + positions snapshot",
-    "/wallet — wallet, deploy amount, HiveMind status",
     "/positions — list open positions",
+    "/pending — show pending sharia approvals",
+    "/config — show important runtime config",
+    "/candidates — refresh top pool list",
+    "/briefing — show morning briefing",
+    "/thresholds — show screening thresholds + performance",
+    "/learn — study top LPers from current candidate pools",
+    "/learn <pool_address> — study top LPers for one pool",
+    "/evolve — evolve thresholds after 5+ closed positions",
+    "/stop — shut down agent",
+  ];
+  const telegramOnly = [
+    "/wallet — wallet, deploy amount, HiveMind status",
     "/pool <n> — detailed info for one open position",
     "/close <n> — close one position by index",
     "/closeall — close all open positions",
     "/set <n> <note> — set note/instruction on position",
-    "/config — show important runtime config",
     "/settings — button menu for common config",
     "/setcfg <key> <value> — update persisted config",
     "/screen — refresh deterministic candidate list",
-    "/candidates — show latest cached candidates",
     "/deploy <n> — deploy candidate by cached index",
-    "/briefing — morning briefing",
     "/hive — HiveMind sync status",
     "/hive pull — manual HiveMind pull now",
     "/pause — stop cron cycles",
     "/resume — start cron cycles again",
-    "/stop — shut down agent",
+  ];
+  const replOnly = [
+    "1 / 2 / 3 ... — deploy cached candidate by number",
+    "auto — let screener pick and deploy automatically",
+    "go — start cron cycles without deploying",
+    "/approve <n> — approve pending sharia candidate and deploy",
+    "/decline <n> — decline pending sharia candidate",
+    "<anything else> — free-form agent chat",
+  ];
+  return [
+    `${surface} commands`,
+    "",
+    ...common,
+    ...(surface === "REPL" ? ["", "REPL-only", "", ...replOnly] : ["", "Telegram-only", "", ...telegramOnly]),
   ].join("\n");
 }
 

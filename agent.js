@@ -79,8 +79,7 @@ function getToolsForRole(agentType, goal = "") {
     }
   }
 
-  // Fall back to all tools if no intent matched
-  if (matched.size === 0) return tools.filter(t => !GENERAL_INTENT_ONLY_TOOLS.has(t.function.name));
+  if (matched.size === 0) return [];
   return tools.filter(t => matched.has(t.function.name));
 }
 import { getWalletBalances } from "./tools/wallet.js";
@@ -97,6 +96,7 @@ const client = new OpenAI({
   baseURL: process.env.LLM_BASE_URL || "https://openrouter.ai/api/v1",
   apiKey: process.env.LLM_API_KEY || process.env.OPENROUTER_API_KEY,
   timeout: 5 * 60 * 1000,
+  defaultHeaders: { "User-Agent": "curl/8.0.0" },
 });
 
 const DEFAULT_MODEL = process.env.LLM_MODEL || "openrouter/healer-alpha";
@@ -204,14 +204,17 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
 
       for (let attempt = 0; attempt < 3; attempt++) {
         try {
+          const selectedTools = getToolsForRole(agentType, goal);
           const reqParams = {
             model: usedModel,
             messages,
-            tools: getToolsForRole(agentType, goal),
             temperature: config.llm.temperature,
             max_tokens: maxOutputTokens ?? config.llm.maxTokens,
           };
-          if (!omitToolChoice) reqParams.tool_choice = toolChoice;
+          if (selectedTools.length > 0) {
+            reqParams.tools = selectedTools;
+            if (!omitToolChoice) reqParams.tool_choice = toolChoice;
+          }
           response = await client.chat.completions.create(reqParams);
         } catch (error) {
           if (providerMode === "system" && isSystemRoleError(error)) {
