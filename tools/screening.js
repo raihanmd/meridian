@@ -4,7 +4,7 @@ import { isDevBlocked, getBlockedDevs } from "../dev-blocklist.js";
 import { log } from "../logger.js";
 import { isBaseMintOnCooldown, isPoolOnCooldown } from "../pool-memory.js";
 import { confirmIndicatorPreset } from "./chart-indicators.js";
-import { getAgentMeridianBase, getAgentMeridianHeaders } from "./agent-meridian.js";
+import { getAgentMeridianBase, getAgentMeridianHeaders, agentMeridianJson } from "./agent-meridian.js";
 
 const DATAPI_JUP = "https://datapi.jup.ag/v1";
 
@@ -100,9 +100,11 @@ function getRawPoolScreeningRejectReason(pool, s) {
   if (pool?.base_token_has_critical_warnings === true) return "base token has critical warnings";
   if (pool?.quote_token_has_critical_warnings === true) return "quote token has critical warnings";
   if (pool?.base_token_has_high_single_ownership === true) return "base token has high single ownership";
-  if (pool?.pool_type && pool.pool_type !== "dlmm") return `pool_type ${pool.pool_type} is not dlmm`;
+  if (pool?.pool_type !== "dlmm") return `pool_type ${pool?.pool_type ?? "unknown"} is not dlmm`;
+  if (!pool?.dlmm_params) return "missing dlmm_params";
+  if (pool?.damm_v2_params) return "damm_v2 pool is not allowed";
 
-  if (mcap == null || mcap < s.minMcap) return `mcap ${mcap ?? "unknown"} below minMcap ${s.minMcap}`;
+  if (mcap == null || mcap < s.minMcap) return `mcap ${mcap ?? "unknown"} below minMcap ${s.minMcap}`; 
   if (mcap > s.maxMcap) return `mcap ${mcap} above maxMcap ${s.maxMcap}`;
   if (holders == null || holders < s.minHolders) return `holders ${holders ?? "unknown"} below minHolders ${s.minHolders}`;
   if (volume == null || volume < s.minVolume) return `volume ${volume ?? "unknown"} below minVolume ${s.minVolume}`;
@@ -665,10 +667,89 @@ export async function getTopCandidates({ limit = 10 } = {}) {
     }
   }
 
+  // Sharia Advisor filter — local allowlist + advisory
+  const pendingCandidates = [];
+  if (eligible.length > 0 && config.screening.shariaEnabled) {
+    const ratedPools = [];
+    for (const pool of eligible) {
+      const baseMint = getPoolBaseMint(pool);
+      const quoteMint = pool?.quote?.mint || pool?.quote_mint || null;
+      const { score, notes, source, manual_approval_required } = await getShariaAdvisorRating({
+        pool_address: pool.pool,
+        mint: baseMint,
+        baseMint,
+        quoteMint,
+      });
+      ratedPools.push({ pool, score, notes, source, manual_approval_required });
+    }
+    const before = eligible.length;
+    const shariaEligible = ratedPools.filter(({ pool, score, source, manual_approval_required }) => {
+      pool.sharia_score = score;
+      pool.sharia_notes = notes;
+      pool.sharia_source = source || "disabled";
+      pool.sharia_manual_approval_required = manual_approval_required || false;
+      if (manual_approval_required) {
+        pendingCandidates.push(pool);
+        pushFilteredReason(filteredOut, pool, `sharia: pair not in allowlist — manual approval required (score ${score})`);
+        log("sharia", `Sharia advisory for ${pool.name} (${pool.pool.slice(0, 8)}): ${notes}`);
+        return false;
+      }
+      return true;
+    });
+    eligible.splice(0, eligible.length, ...shariaEligible);
+    if (eligible.length < before) {
+      log("screening", `Sharia Advisor filter removed ${before - eligible.length} candidate(s)`);
+    }
+  }
+
   return {
     candidates: eligible,
+    pending_candidates: pendingCandidates,
     total_screened: pools.length,
     filtered_examples: filteredOut.slice(0, 3),
+  };
+}
+
+
+/**
+ * Get Sharia Advisor rating for a pool using local allowlist.
+ * Returns { score, notes, source, manual_approval_required }.
+ * No external API calls.
+ */
+export async function getShariaAdvisorRating({ pool_address, mint, baseMint, quoteMint }) {
+  if (!config.screening.shariaEnabled) {
+    return { score: 100, notes: "", source: "disabled", manual_approval_required: false };
+  }
+
+  const base = baseMint || mint || null;
+  const quote = quoteMint || null;
+
+  if (!config.screening.shariaAllowlistedPairs?.length) {
+    return {
+      score: 51,
+      notes: "No sharia allowlist. Manual approval required before deploy.",
+      source: "advisory",
+      manual_approval_required: true,
+    };
+  }
+
+  // Check allowlist — order-insensitive pair match
+  const isAllowed = config.screening.shariaAllowlistedPairs.some(pair => {
+    const a = pair.baseMint || pair.base_mint;
+    const b = pair.quoteMint || pair.quote_mint;
+    if (!a || !b || !base || !quote) return false;
+    return (base === a && quote === b) || (base === b && quote === a);
+  });
+
+  if (isAllowed) {
+    return { score: 100, notes: "Allowlisted pair", source: "local_allowlist", manual_approval_required: false };
+  }
+
+  return {
+    score: 51,
+    notes: "Pair not in sharia allowlist. Manual approval required before deploy.",
+    source: "advisory",
+    manual_approval_required: true,
   };
 }
 

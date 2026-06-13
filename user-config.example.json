@@ -9,20 +9,20 @@
   "deployAmountSol": 0.5,
   "maxPositions": 3,
   "minSolToOpen": 0.55,
-  "maxDeployAmount": 50,
+  "maxDeployAmount": 20,
   "gasReserve": 0.2,
   "positionSizePct": 0.35,
 
   "strategy": "bid_ask",
   "minBinsBelow": 35,
-  "maxBinsBelow": 69,
-  "defaultBinsBelow": 69,
+  "maxBinsBelow": 55,
+  "defaultBinsBelow": 55,
 
   "timeframe": "5m",
   "category": "trending",
   "excludeHighSupplyConcentration": true,
   "minTvl": 10000,
-  "maxTvl": 150000,
+  "maxTvl": 500000,
   "minVolume": 500,
   "minOrganic": 60,
   "minQuoteOrganic": 60,
@@ -43,6 +43,30 @@
   "blockedLaunchpads": [],
   "minTokenAgeHours": null,
   "maxTokenAgeHours": null,
+  "shariaEnabled": true,
+  "shariaAllowlistedPairs": [
+    {
+      "baseMint": "So11111111111111111111111111111111111111112",
+      "quoteMint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+    },
+    {
+      "baseMint": "So11111111111111111111111111111111111111112",
+      "quoteMint": "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
+    },
+    {
+      "baseMint": "cbbtcf3aa214zXHbiAZQwf4122FBYbraNdFqgw4iMij",
+      "quoteMint": "So11111111111111111111111111111111111111112"
+    },
+    {
+      "baseMint": "cbbtcf3aa214zXHbiAZQwf4122FBYbraNdFqgw4iMij",
+      "quoteMint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+    },
+    {
+      "baseMint": "cbbtcf3aa214zXHbiAZQwf4122FBYbraNdFqgw4iMij",
+      "quoteMint": "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
+    }
+  ],
+  "shariaManualApprovalTimeoutMinutes": 30,
 
   "minClaimAmount": 5,
   "autoSwapAfterClaim": false,
@@ -51,10 +75,10 @@
   "oorCooldownTriggerCount": 3,
   "oorCooldownHours": 12,
   "minVolumeToRebalance": 1000,
-  "stopLossPct": -50,
+  "stopLossPct": -15,
   "takeProfitPct": 5,
   "minFeePerTvl24h": 7,
-  "minAgeBeforeYieldCheck": 60,
+  "minAgeBeforeYieldCheck": 120,
   "trailingTakeProfit": true,
   "trailingTriggerPct": 3,
   "trailingDropPct": 1.5,

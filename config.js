@@ -88,6 +88,15 @@ export const config = {
     blockedLaunchpads:  u.blockedLaunchpads  ?? [],  // e.g. ["letsbonk.fun", "pump.fun"]
     minTokenAgeHours:   u.minTokenAgeHours   ?? null, // null = no minimum
     maxTokenAgeHours:   u.maxTokenAgeHours   ?? null, // null = no maximum
+    shariaEnabled:            u.shariaEnabled            ?? false,
+    shariaAllowlistedPairs:   u.shariaAllowlistedPairs   ?? [
+    { baseMint: "So11111111111111111111111111111111111111112", quoteMint: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v" },
+    { baseMint: "So11111111111111111111111111111111111111112", quoteMint: "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB" },
+    { baseMint: "cbbtcf3aa214zXHbiAZQwf4122FBYbraNdFqgw4iMij", quoteMint: "So11111111111111111111111111111111111111112" },
+    { baseMint: "cbbtcf3aa214zXHbiAZQwf4122FBYbraNdFqgw4iMij", quoteMint: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v" },
+    { baseMint: "cbbtcf3aa214zXHbiAZQwf4122FBYbraNdFqgw4iMij", quoteMint: "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB" },
+  ],     // [{baseMint, quoteMint}] — order-insensitive
+    shariaManualApprovalTimeoutMinutes: u.shariaManualApprovalTimeoutMinutes ?? 30,
   },
 
   // ─── Position Management ────────────────
@@ -163,6 +172,7 @@ export const config = {
     SOL:  "So11111111111111111111111111111111111111112",
     USDC: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
     USDT: "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
+    CBBTC: "cbbtcf3aa214zXHbiAZQwf4122FBYbraNdFqgw4iMij",
   },
 
   // ─── HiveMind ─────────────────────────
@@ -263,6 +273,9 @@ export function reloadScreeningThresholds() {
     if (fresh.maxBotHoldersPct  != null) s.maxBotHoldersPct = fresh.maxBotHoldersPct;
     if (fresh.allowedLaunchpads !== undefined) s.allowedLaunchpads = fresh.allowedLaunchpads;
     if (fresh.blockedLaunchpads !== undefined) s.blockedLaunchpads = fresh.blockedLaunchpads;
+    if (fresh.shariaEnabled !== undefined) s.shariaEnabled = fresh.shariaEnabled;
+    if (fresh.shariaAllowlistedPairs !== undefined) s.shariaAllowlistedPairs = fresh.shariaAllowlistedPairs;
+    if (fresh.shariaManualApprovalTimeoutMinutes !== undefined) s.shariaManualApprovalTimeoutMinutes = fresh.shariaManualApprovalTimeoutMinutes;
     const minBinsBelow = numericConfig(fresh.minBinsBelow) ?? config.strategy.minBinsBelow;
     const maxBinsBelow = numericConfig(fresh.maxBinsBelow) ?? numericConfig(fresh.binsBelow) ?? config.strategy.maxBinsBelow;
     const defaultBinsBelow = numericConfig(fresh.defaultBinsBelow) ?? numericConfig(fresh.binsBelow) ?? config.strategy.defaultBinsBelow ?? maxBinsBelow;

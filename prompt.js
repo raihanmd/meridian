@@ -125,6 +125,7 @@ DEPLOY RULES:
 - Bin steps must be [80-125].
 - Pick ONE pool only when conviction is real. If only one weak candidate survives, skip and explain why none qualify.
 
+- SHARIA COMPLIANCE: Candidates include sharia_score and sharia_source. When shariaEnabled: allowlisted pairs show sharia:local_allowlist and pass; non-allowlisted pairs show sharia:advisory ⚠️manual_approval and are excluded from auto-deploy. Pools tagged manual_approval_required should never be deployed without explicit user approval.
 ${weightsSummary ? `${weightsSummary}\nPrioritize candidates whose strongest attributes align with high-weight signals.\n\n` : ""}${lessons ? `LESSONS LEARNED:\n${lessons}\n` : ""}Timestamp: ${new Date().toISOString()}
 `;
   } else if (agentType === "MANAGER") {
