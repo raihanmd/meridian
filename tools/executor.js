@@ -165,6 +165,20 @@ async function validateDeployPoolThresholds(args) {
   }
 
   const baseMint = detail?.token_x?.address || detail?.base_token_address || null;
+  const quoteMint = detail?.token_y?.address || null;
+
+  // Token allowlist check
+  const allowlist = config.screening.tokenAllowlist;
+  if (Array.isArray(allowlist) && allowlist.length > 0) {
+    const allowlistMints = new Set(allowlist.map((t) => t.mint));
+    if (!baseMint || !quoteMint || !allowlistMints.has(baseMint) || !allowlistMints.has(quoteMint)) {
+      return {
+        pass: false,
+        reason: `Token allowlist violation: pool tokens (${baseMint?.slice(0, 8)}.../${quoteMint?.slice(0, 8)}...) are not both in the allowlist.`,
+      };
+    }
+  }
+
   const entryMarketData = {
     entry_mcap: numberOrNull(detail?.token_x?.market_cap ?? detail?.base_token_market_cap),
     entry_tvl: tvl,
@@ -365,6 +379,7 @@ const toolMap = {
       blockedLaunchpads: ["screening", "blockedLaunchpads"],
       minTokenAgeHours: ["screening", "minTokenAgeHours"],
       maxTokenAgeHours: ["screening", "maxTokenAgeHours"],
+      tokenAllowlist: ["screening", "tokenAllowlist"],
       minFeePerTvl24h: ["management", "minFeePerTvl24h"],
       // management
       minClaimAmount: ["management", "minClaimAmount"],

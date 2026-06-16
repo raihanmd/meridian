@@ -43,6 +43,10 @@
   "blockedLaunchpads": [],
   "minTokenAgeHours": null,
   "maxTokenAgeHours": null,
+  "tokenAllowlist": [
+    {"name": "SOL", "mint": "So11111111111111111111111111111111111111112"},
+    {"name": "GHOST", "mint": "ghost...mint..."}
+  ],
 
   "minClaimAmount": 5,
   "autoSwapAfterClaim": false,
