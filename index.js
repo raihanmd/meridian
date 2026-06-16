@@ -1744,47 +1744,60 @@ function formatHelpText() {
 
 async function runDeterministicScreen(limit = 5) {
   const top = await getTopCandidates({ limit });
-  let candidates = (top?.candidates || top?.pools || []).slice(0, limit);
+  const allCandidates = (top?.candidates || top?.pools || []).slice(0, limit);
 
-  // Filter by token allowlist if active
   const allowlistMints = new Set(
     (config.screening.tokenAllowlist || []).map((t) => t.mint),
   );
-  if (allowlistMints.size > 0) {
-    candidates = candidates.filter((pool) => {
+  const isAllowlistActive = allowlistMints.size > 0;
+
+  let allowlisted = allCandidates;
+  let nonAllowlisted = [];
+  if (isAllowlistActive) {
+    allowlisted = allCandidates.filter((pool) => {
       const baseMint = pool.base?.mint || null;
       const quoteMint = pool.quote?.mint || null;
-      const allowed =
-        baseMint &&
-        quoteMint &&
-        allowlistMints.has(baseMint) &&
-        allowlistMints.has(quoteMint);
-      if (!allowed) {
-        log(
-          "screening",
-          `Deterministic screen: skipped ${pool.name} — not in token allowlist`,
-        );
-      }
-      return allowed;
+      return baseMint && quoteMint && allowlistMints.has(baseMint) && allowlistMints.has(quoteMint);
+    });
+    nonAllowlisted = allCandidates.filter((pool) => {
+      const baseMint = pool.base?.mint || null;
+      const quoteMint = pool.quote?.mint || null;
+      return !baseMint || !quoteMint || !allowlistMints.has(baseMint) || !allowlistMints.has(quoteMint);
     });
   }
 
-  setLatestCandidates(candidates);
-  if (candidates.length > 0) {
-    const lines = candidates.map((pool, i) => {
+  setLatestCandidates(allowlisted);
+
+  const parts = [];
+  if (isAllowlistActive && allCandidates.length > 0) {
+    const overview = [
+      "🔍 All passing candidates:",
+      ...allowlisted.map((pool) => `✅ ${pool.name} — allowlisted`),
+      ...nonAllowlisted.map((pool) => `⏭️ ${pool.name} — not in token allowlist`),
+    ];
+    parts.push(overview.join("\n"));
+  }
+
+  if (allowlisted.length > 0) {
+    const lines = allowlisted.map((pool, i) => {
       const feeTvl = pool.fee_active_tvl_ratio ?? pool.fee_tvl_ratio ?? "?";
       const vol = pool.volume_window ?? pool.volume_24h ?? "?";
       return `${i + 1}. ${pool.name} | ${pool.pool}\n   fee/aTVL ${feeTvl}% | vol $${vol} | organic ${pool.organic_score ?? "?"}`;
     });
-    return `Top candidates (${candidates.length})\n\n${lines.join("\n")}`;
+    parts.push(`Top candidates (${allowlisted.length})\n\n${lines.join("\n")}`);
+  } else {
+    const examples = (top?.filtered_examples || [])
+      .slice(0, 3)
+      .map((entry) => `- ${entry.name}: ${entry.reason}`)
+      .join("\n");
+    parts.push(
+      examples
+        ? `No candidates available.\nFiltered examples:\n${examples}`
+        : "No candidates available right now.",
+    );
   }
-  const examples = (top?.filtered_examples || [])
-    .slice(0, 3)
-    .map((entry) => `- ${entry.name}: ${entry.reason}`)
-    .join("\n");
-  return examples
-    ? `No candidates available.\nFiltered examples:\n${examples}`
-    : "No candidates available right now.";
+
+  return parts.join("\n\n");
 }
 
 async function deployLatestCandidate(index) {
