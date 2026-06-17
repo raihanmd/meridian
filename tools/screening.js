@@ -489,10 +489,9 @@ export async function discoverPools({ page_size = 50 } = {}) {
     "quote_token_is_not_verified=false",
     "base_token_has_critical_warnings=false",
     "quote_token_has_critical_warnings=false",
-    s.excludeHighSupplyConcentration
-      ? "base_token_has_high_supply_concentration=false"
-      : null,
+    "base_token_has_high_supply_concentration=false",
     "base_token_has_high_single_ownership=false",
+    "active_tvl>=2000",
     "pool_type=dlmm",
     `base_token_market_cap>=${s.minMcap}`,
     `base_token_market_cap<=${s.maxMcap}`,
