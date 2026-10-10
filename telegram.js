@@ -253,6 +253,7 @@ function summarizeToolResult(name, result) {
   if (result.reason && result.blocked) return result.reason;
   switch (name) {
     case "deploy_position":
+      if (result.dry_run) return "DRY RUN — would deploy; no transaction sent";
       return result.position ? `position ${String(result.position).slice(0, 8)}...` : "submitted";
     case "close_position":
       return result.success ? "closed" : (result.reason || "failed");

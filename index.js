@@ -8,6 +8,7 @@ import { log } from "./logger.js";
 import { getMyPositions, closePosition, getActiveBin } from "./tools/dlmm.js";
 import { getWalletBalances } from "./tools/wallet.js";
 import { discoverPools, getTopCandidates } from "./tools/screening.js";
+import { formatDryRunDeploy } from "./screening-report.js";
 import { getPoolAllowlistDisplay, getPoolRestrictionReason } from "./token-allowlist.js";
 import { DEFAULT_RESEARCH_DIR, enqueueResearchCandidates } from "./research/queue.js";
 import { startBackgroundResearchWorker } from "./research/worker.js";
@@ -398,19 +399,16 @@ async function recordResearchCandidates(discovery, source) {
   const result = await enqueueResearchCandidates(RESEARCH_ROOT, discovery.pools);
   log("observer", `${source}: ${result.seen} filtered pool(s), ${result.added} new token(s) queued for research`);
   if (source === "screening cycle" && telegramEnabled()) {
-    const message = `🔬 Observer scan selesai\nPool lolos filter: ${result.seen} (API total: ${discovery.total ?? "?"}; halaman pertama maksimal 50)\nToken baru masuk antrean riset: ${result.added}\nEksekusi tetap dibatasi tokenAllowlist.`;
-    sendMessage(message, { timeoutMs: 15_000 })
-      .then((response) => {
-        if (!response?.ok) log("observer_warn", "Observer scan Telegram notification was not confirmed");
-      })
-      .catch((error) => log("observer_warn", `Observer scan Telegram notification failed: ${error.message}`));
+    const message = `Scan berkala selesai. Token baru masuk antrean riset: ${result.added}.\nDaftar di bawah untuk observasi; eksekusi tetap dibatasi tokenAllowlist.\n\n${formatTelegramCandidates(discovery)}`;
+    sendScreeningText(message)
+      .catch((error) => log("observer_warn", `Observer candidate list Telegram notification failed: ${error.message}`));
   }
   return result;
 }
 
 function notifyScreeningSkip(report, silent) {
   if (silent || !telegramEnabled()) return;
-  sendMessage(`🔍 Screening Cycle\n\n${report}`, { timeoutMs: 15_000 })
+  sendMessage(`🔍 SCREENING DEPLOYMENT\n\n${report}`, { timeoutMs: 15_000 })
     .then((response) => {
       if (!response?.ok) log("telegram_warn", "Screening skip notification was not confirmed");
     })
@@ -481,7 +479,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
     return screenReport;
   }
   if (!silent && telegramEnabled()) {
-    liveMessage = await createLiveMessage("🔍 Screening Cycle", "Scanning candidates...");
+    liveMessage = await createLiveMessage(process.env.DRY_RUN === "true" ? "🧪 DRY RUN · SCREENING DEPLOYMENT" : "🔍 SCREENING DEPLOYMENT", "Checking allowlisted SOL pairs...");
   }
   log("cron", `Starting screening cycle [model: ${config.llm.screeningModel}]`);
   try {
@@ -497,7 +495,14 @@ export async function runScreeningCycle({ silent = false } = {}) {
       + (activeStrategy ? `\nSTRATEGY CONTEXT: ${activeStrategy.name} — entry: ${activeStrategy.entry?.condition || "n/a"} | exit: ${activeStrategy.exit?.notes || "n/a"} | best for: ${activeStrategy.best_for}` : "");
 
     // Fetch top candidates, then recon each sequentially with a small delay to avoid 429s
-    const topCandidates = await getTopCandidates({ limit: 10, discovery: observerDiscovery }).catch(() => null);
+    const topCandidates = await getTopCandidates({ limit: 10, discovery: observerDiscovery }).catch((error) => {
+      log("screening_warn", `Deployment candidate evaluation failed: ${error.message}`);
+      return null;
+    });
+    if (!topCandidates) {
+      screenReport = "Deployment candidate evaluation failed. Discovery results remain available for observation; check bot logs.";
+      return screenReport;
+    }
     const candidates = (topCandidates?.candidates || topCandidates?.pools || []).slice(0, 10);
     log("cron", `Deploy-eligible candidates after allowlist and position guards: ${candidates.length}`);
     const earlyFilteredExamples = topCandidates?.filtered_examples || [];
@@ -549,9 +554,11 @@ export async function runScreeningCycle({ silent = false } = {}) {
       const combinedExamples = combined.slice(0, 3)
         .map((entry) => `- ${entry.name}: ${entry.reason}`)
         .join("\n");
-      screenReport = combinedExamples
-        ? `No candidates available.\nFiltered examples:\n${combinedExamples}`
-        : `No candidates available (all filtered by launchpad / holder-quality rules).`;
+      screenReport = [
+        "No deploy-ready pools in this screening cycle.",
+        `${observerDiscovery.pools.length} pool(s) still matched discovery filters for observation.`,
+        ...(combinedExamples ? ["Deployment filter examples:", combinedExamples] : []),
+      ].join("\n");
       appendDecision({
         type: "no_deploy",
         actor: "SCREENER",
@@ -646,6 +653,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
 
     let deployAttempted = false;
     let deploySucceeded = false;
+    let simulatedDeploy = null;
     const { content } = await agentLoop(`
 SCREENING CYCLE
 ${strategyBlock}
@@ -720,19 +728,23 @@ IMPORTANT:
           if (name === "deploy_position") {
             deployAttempted = true;
             deploySucceeded = Boolean(success && result?.success !== false && !result?.error && !result?.blocked);
+            if (deploySucceeded && result?.dry_run) simulatedDeploy = result;
           }
           await liveMessage?.toolFinish(name, result, success);
         },
       });
-    screenReport = content;
-    if (/⛔\s*NO DEPLOY/i.test(content)) {
+    screenReport = simulatedDeploy ? formatDryRunDeploy(simulatedDeploy, passing.map(({ pool }) => pool)) : content;
+    if (!deploySucceeded && /^\s*(?:🚀\s*DEPLOYED|🧪\s*DRY RUN\s*·\s*WOULD DEPLOY)/i.test(screenReport)) {
+      screenReport = "⛔ NO DEPLOY\n\nThe agent reported a deploy, but no successful deploy_position result was recorded. Check bot logs.";
+    }
+    if (!simulatedDeploy && /⛔\s*NO DEPLOY/i.test(content)) {
       appendDecision({
         type: "no_deploy",
         actor: "SCREENER",
         summary: "LLM chose no deploy",
         reason: stripThink(content).slice(0, 500),
       });
-    } else if (!deploySucceeded) {
+    } else if (!simulatedDeploy && !deploySucceeded) {
       appendDecision({
         type: "no_deploy",
         actor: "SCREENER",
@@ -749,7 +761,7 @@ IMPORTANT:
     if (!silent && telegramEnabled()) {
       if (screenReport) {
         if (liveMessage) await liveMessage.finalize(stripThink(screenReport)).catch(() => {});
-        else sendMessage(`🔍 Screening Cycle\n\n${stripThink(screenReport)}`).catch(() => { });
+        else sendMessage(`🔍 SCREENING DEPLOYMENT\n\n${stripThink(screenReport)}`).catch(() => { });
       }
     }
   }
