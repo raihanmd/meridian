@@ -84,14 +84,19 @@ test("old source-less reports are requeued once for verified web research", asyn
 
 test("Hermes receives web provider credentials but not Meridian wallet secrets", () => {
   const previous = process.env.FIRECRAWL_API_KEY;
+  const previousUrl = process.env.FIRECRAWL_API_URL;
   process.env.FIRECRAWL_API_KEY = "test-web-key";
+  process.env.FIRECRAWL_API_URL = "http://127.0.0.1:3002";
   try {
     assert.equal(hermesEnv().FIRECRAWL_API_KEY, "test-web-key");
+    assert.equal(hermesEnv().FIRECRAWL_API_URL, "http://127.0.0.1:3002");
     assert.equal(hermesEnv().WALLET_PRIVATE_KEY, undefined);
     assert.equal(hermesEnv().TELEGRAM_BOT_TOKEN, undefined);
   } finally {
     if (previous === undefined) delete process.env.FIRECRAWL_API_KEY;
     else process.env.FIRECRAWL_API_KEY = previous;
+    if (previousUrl === undefined) delete process.env.FIRECRAWL_API_URL;
+    else process.env.FIRECRAWL_API_URL = previousUrl;
   }
 });
 

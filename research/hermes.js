@@ -10,7 +10,7 @@ export function researchPrompt(job) {
 
 export function hermesEnv() {
   const names = ["PATH", "HOME", "USER", "LANG", "LC_ALL", "TERM", "HERMES_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "VIRTUAL_ENV", "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE",
-    "EXA_API_KEY", "PARALLEL_API_KEY", "FIRECRAWL_API_KEY", "TAVILY_API_KEY", "PERPLEXITY_API_KEY", "KEENABLE_API_KEY", "SEARXNG_URL", "BRAVE_API_KEY", "BRAVE_SEARCH_API_KEY"];
+    "EXA_API_KEY", "PARALLEL_API_KEY", "FIRECRAWL_API_KEY", "FIRECRAWL_API_URL", "TAVILY_API_KEY", "PERPLEXITY_API_KEY", "KEENABLE_API_KEY", "SEARXNG_URL", "BRAVE_API_KEY", "BRAVE_SEARCH_API_KEY"];
   const env = {};
   for (const name of names) if (process.env[name]) env[name] = process.env[name];
   return env;
