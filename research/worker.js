@@ -39,6 +39,29 @@ export async function announceResearchHeartbeat(jobs, send = sendMessage) {
   if (!response?.ok) throw new Error("Telegram did not confirm research heartbeat delivery");
 }
 
+export async function requeueLegacyUnverifiedReports(root = ROOT, now = Date.now()) {
+  let requeued = 0;
+  for (const job of await listJobs(root)) {
+    if (!["ready", "sent"].includes(job.status)) continue;
+    let report;
+    try { report = await readReport(root, job.mint); }
+    catch { continue; }
+    if (report?.webSearchVerified === true || report?.sources?.length) continue;
+    job.status = "pending";
+    job.attempts = 0;
+    job.nextAttemptAt = now;
+    job.deliveryAttempts = 0;
+    job.nextDeliveryAt = now;
+    job.deliveredParts = 0;
+    job.judgment = null;
+    job.error = null;
+    delete job.sentAt;
+    await saveJob(root, job);
+    requeued++;
+  }
+  return requeued;
+}
+
 export async function processResearchJobs(root = ROOT, { research = runHermesResearch, send = sendMessage, now = Date.now, maxJobs = Infinity, signal } = {}) {
   const jobs = await listJobs(root);
   let processed = 0;
@@ -182,6 +205,8 @@ export async function main() {
   process.on("SIGINT", stop);
   process.on("SIGTERM", stop);
   try {
+    const requeued = await requeueLegacyUnverifiedReports(ROOT);
+    if (requeued) console.log(`[RESEARCH] Requeued ${requeued} old report(s) made without verified web search`);
     let nextHeartbeatAt = 0;
     let warnedMissingJudge = false;
     while (!stopping) {

@@ -5,11 +5,11 @@ import path from "node:path";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import test from "node:test";
-import { enqueuePool, enqueueResearchCandidates, listJobs, readReport } from "../research/queue.js";
-import { runHermesResearch } from "../research/hermes.js";
+import { enqueuePool, enqueueResearchCandidates, listJobs, readReport, saveJob, saveReport } from "../research/queue.js";
+import { hermesEnv, runHermesResearch } from "../research/hermes.js";
 import { parseReport, splitTelegram } from "../research/report.js";
 import { retryFailedResearch } from "../research/retry.js";
-import { announceResearchHeartbeat, formatResearchHeartbeat, processResearchJobs } from "../research/worker.js";
+import { announceResearchHeartbeat, formatResearchHeartbeat, processResearchJobs, requeueLegacyUnverifiedReports } from "../research/worker.js";
 import { SOL_MINT } from "../token-allowlist.js";
 
 const MINT = "7KEPApdbBMByrmqihz3bht2uMhFQcatjfSFQCKq66kH3";
@@ -65,6 +65,36 @@ test("research worker heartbeat reports queue health without fetching pools", as
   await announceResearchHeartbeat([], async (text) => { assert.match(text, /worker aktif/); return { ok: true }; });
 });
 
+test("old source-less reports are requeued once for verified web research", async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "meridian-research-"));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  await enqueuePool(root, pool(MINT));
+  const [job] = await listJobs(root);
+  job.status = "sent";
+  job.judgment = { status: "sent" };
+  await saveJob(root, job);
+  await saveReport(root, MINT, parseReport(JSON.stringify({ ...report(), sources: [] }), job));
+  assert.equal(await requeueLegacyUnverifiedReports(root, 1000), 1);
+  const [requeued] = await listJobs(root);
+  assert.equal(requeued.status, "pending");
+  assert.equal(requeued.nextAttemptAt, 1000);
+  assert.equal(requeued.judgment, null);
+  assert.equal(await requeueLegacyUnverifiedReports(root, 1000), 0);
+});
+
+test("Hermes receives web provider credentials but not Meridian wallet secrets", () => {
+  const previous = process.env.FIRECRAWL_API_KEY;
+  process.env.FIRECRAWL_API_KEY = "test-web-key";
+  try {
+    assert.equal(hermesEnv().FIRECRAWL_API_KEY, "test-web-key");
+    assert.equal(hermesEnv().WALLET_PRIVATE_KEY, undefined);
+    assert.equal(hermesEnv().TELEGRAM_BOT_TOKEN, undefined);
+  } finally {
+    if (previous === undefined) delete process.env.FIRECRAWL_API_KEY;
+    else process.env.FIRECRAWL_API_KEY = previous;
+  }
+});
+
 test("report rejects wrong mint and preserves source URLs", () => {
   assert.throws(() => parseReport(JSON.stringify(report(OTHER)), { mint: MINT, symbol: "DARK" }), /mint does not match/);
   const parsed = parseReport(JSON.stringify(report()), { mint: MINT, symbol: "DARK" });
@@ -86,6 +116,7 @@ test("Hermes receives a prompt file and only the web toolset, without Meridian w
     child.stderr = new PassThrough();
     child.kill = () => {};
     queueMicrotask(() => {
+      child.stdout.write(JSON.stringify({ type: "tool_result", name: "web_search", is_error: false, output: '{"success":true,"data":{"web":[]}}' }) + "\n");
       child.stdout.write(JSON.stringify({ type: "result", exit_code: 0, text: JSON.stringify(report()) }) + "\n");
       child.emit("close", 0);
     });
@@ -93,6 +124,7 @@ test("Hermes receives a prompt file and only the web toolset, without Meridian w
   };
   const result = await runHermesResearch({ mint: MINT, symbol: "DARK", pool: "pool" }, { root, spawnFn });
   assert.equal(result.mint, MINT);
+  assert.equal(result.webSearchVerified, true);
   assert.match(await fs.readFile(path.join(root, MINT, "prompt.txt"), "utf8"), /EXACT mint/);
 });
 
@@ -115,7 +147,9 @@ test("Hermes retries a rejected CLI flag with a basic one-shot command", async (
       } else {
         assert.deepEqual(args.slice(0, 3), ["chat", "-Q", "-q"]);
         assert.equal(args[args.indexOf("--toolsets") + 1], "web");
-        child.stdout.write(JSON.stringify(report()));
+        assert.equal(args[args.indexOf("--format") + 1], "stream-json");
+        child.stdout.write(JSON.stringify({ type: "tool_result", name: "web_search", is_error: false, output: '{"success":true}' }) + "\n");
+        child.stdout.write(JSON.stringify({ type: "result", exit_code: 0, text: JSON.stringify(report()) }) + "\n");
         child.emit("close", 0);
       }
     });
@@ -124,6 +158,43 @@ test("Hermes retries a rejected CLI flag with a basic one-shot command", async (
   const result = await runHermesResearch({ mint: MINT, symbol: "DARK", pool: "pool" }, { root, spawnFn });
   assert.equal(result.mint, MINT);
   assert.equal(calls, 2);
+});
+
+test("Hermes answer without a web search is retried instead of sent as a report", async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "meridian-research-"));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  await enqueuePool(root, pool(MINT));
+  const spawnFn = () => {
+    const child = new EventEmitter();
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.kill = () => {};
+    queueMicrotask(() => {
+      child.stdout.write(JSON.stringify({ type: "result", exit_code: 0, text: JSON.stringify({ ...report(), sources: [] }) }) + "\n");
+      child.emit("close", 0);
+    });
+    return child;
+  };
+  await assert.rejects(runHermesResearch({ mint: MINT, symbol: "DARK", pool: "pool" }, { root, spawnFn }), /successful web_search/);
+});
+
+test("failed web_search result cannot become a completed research report", async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "meridian-research-"));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  await enqueuePool(root, pool(MINT));
+  const spawnFn = () => {
+    const child = new EventEmitter();
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.kill = () => {};
+    queueMicrotask(() => {
+      child.stdout.write(JSON.stringify({ type: "tool_result", name: "web_search", is_error: false, output: '{"success":false,"error":"provider key missing"}' }) + "\n");
+      child.stdout.write(JSON.stringify({ type: "result", exit_code: 0, text: JSON.stringify({ ...report(), sources: [] }) }) + "\n");
+      child.emit("close", 0);
+    });
+    return child;
+  };
+  await assert.rejects(runHermesResearch({ mint: MINT, symbol: "DARK", pool: "pool" }, { root, spawnFn }), /successful web_search/);
 });
 
 test("research retries failure and delivery retries from saved report", async (t) => {

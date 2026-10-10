@@ -12,6 +12,7 @@
     "env:encrypt": "node scripts/envrypt.js encrypt",
     "start": "node index.js",
     "research:start": "node research/worker.js",
+    "research:probe": "node research/probe.js",
     "research:retry": "node research/retry.js",
     "pm2:start": "pm2 start ecosystem.config.cjs",
     "pm2:restart": "pm2 restart meridian --update-env",
