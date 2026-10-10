@@ -945,19 +945,6 @@ function getLatestCandidatesMeta() {
   };
 }
 
-function describeLatestCandidates(limit = 50) {
-  if (!_latestCandidates.length) return "No cached candidates yet. Run /screen first.";
-  const lines = _latestCandidates.slice(0, limit).map((pool, i) => {
-    const feeTvl = pool.fee_active_tvl_ratio ?? pool.fee_tvl_ratio ?? "?";
-    const vol = pool.volume_window ?? pool.volume_24h ?? "?";
-    const active = pool.active_pct ?? "?";
-    const organic = pool.organic_score ?? "?";
-    return `${i + 1}. [${candidateRestriction(pool) ? "OBSERVE" : "ALLOWLIST"}] ${pool.name} | ${pool.pool} | fee/aTVL ${feeTvl} | vol $${vol} | in-range ${active}% | organic ${organic}`;
-  });
-  const age = _latestCandidatesAt ? new Date(_latestCandidatesAt).toLocaleString("en-US", { hour12: false }) : "unknown";
-  return `Latest candidates (${_latestCandidates.length}) — updated ${age}\n\n${lines.join("\n")}`;
-}
-
 function formatWalletStatus(wallet, positions) {
   const deployAmount = computeDeployAmount(wallet.sol);
   const hive = isHiveMindEnabled() ? "on" : "off";
@@ -1257,7 +1244,7 @@ function formatHelpText() {
     "/settings — button menu for common config",
     "/setcfg <key> <value> — update persisted config",
     "/screen — refresh deterministic candidate list",
-    "/candidates — show latest cached candidates",
+    "/candidates — refresh pools matching screening config",
     "/deploy <n> — deploy candidate by cached index",
     "/briefing — morning briefing",
     "/hive — HiveMind sync status",
@@ -1268,15 +1255,13 @@ function formatHelpText() {
   ].join("\n");
 }
 
-async function runDeterministicScreen() {
-  const discovery = await discoverPools({ page_size: 50 });
+function formatTelegramCandidates(discovery) {
   const candidates = discovery.pools;
-  setLatestCandidates(candidates);
   if (candidates.length > 0) {
     const lines = candidates.map((pool, i) => {
       const feeTvl = pool.fee_active_tvl_ratio ?? pool.fee_tvl_ratio ?? "?";
       const vol = pool.volume_window ?? pool.volume_24h ?? "?";
-      const status = candidateRestriction(pool) ? "OBSERVE" : "ALLOWLIST";
+      const status = candidateRestriction(pool) ? "OBSERVE" : "✅ ALLOWLIST";
       return `${i + 1}. [${status}] ${pool.name} | ${pool.pool}\n   fee/aTVL ${feeTvl} | vol $${vol} | organic ${pool.organic_score ?? "?"}`;
     });
     return `Pools matching config: ${candidates.length} (API total: ${discovery.total ?? "?"}, received: ${discovery.screened})\n\n${lines.join("\n")}`;
@@ -1289,16 +1274,26 @@ async function runDeterministicScreen() {
     : `No pools matched config (API total: ${discovery.total ?? "?"}, received: ${discovery.screened}).`;
 }
 
+async function runDeterministicScreen() {
+  const discovery = await discoverPools({ page_size: 50 });
+  setLatestCandidates(discovery.pools);
+  return formatTelegramCandidates(discovery);
+}
+
 async function sendScreeningText(text) {
+  const sendChunk = async (chunk) => {
+    const result = await sendMessage(chunk, { timeoutMs: 15000 });
+    if (!result?.ok) throw new Error("Could not deliver candidate list to Telegram; check Telegram settings and logs.");
+  };
   let chunk = "";
   for (const line of text.split("\n")) {
     if (chunk.length + line.length + 1 > 3500 && chunk) {
-      await sendMessage(chunk);
+      await sendChunk(chunk);
       chunk = "";
     }
     chunk += `${line}\n`;
   }
-  if (chunk) await sendMessage(chunk);
+  if (chunk) await sendChunk(chunk);
 }
 
 async function deployLatestCandidate(index) {
@@ -1551,17 +1546,12 @@ async function telegramHandler(msg) {
     return;
   }
 
-  if (text === "/screen") {
+  if (text === "/screen" || text === "/candidates") {
     try {
-      await sendScreeningText(await runDeterministicScreen()).catch(() => {});
+      await sendScreeningText(await runDeterministicScreen());
     } catch (e) {
       await sendMessage(`Error: ${e.message}`).catch(() => {});
     }
-    return;
-  }
-
-  if (text === "/candidates") {
-    await sendScreeningText(describeLatestCandidates()).catch(() => {});
     return;
   }
 
@@ -1794,7 +1784,7 @@ Commands:
   1 / 2 / 3 ...  Deploy ${DEPLOY} SOL into an ALLOWLIST pool
   auto           Let the agent pick and deploy automatically
   /status        Refresh wallet + positions
-  /candidates    Refresh pools matching screening config
+  /candidates    Refresh pools matching screening config and send to Telegram
   /briefing      Show morning briefing (last 24h)
   /learn         Study top LPers from the best current pool and save lessons
   /learn <addr>  Study top LPers from a specific pool address
@@ -1883,11 +1873,13 @@ Commands:
 
     if (input === "/candidates") {
       await runBusy(async () => {
-        const { pools, total, screened, filtered_examples } = await discoverPools({ page_size: 50 });
+        const discovery = await discoverPools({ page_size: 50 });
+        const { pools, total, screened, filtered_examples } = discovery;
         setLatestCandidates(pools);
         console.log(`\nPools matching config: ${pools.length} (API total: ${total ?? "?"}, received: ${screened})\n`);
         console.log(formatCandidates(pools, filtered_examples));
         console.log();
+        await sendScreeningText(formatTelegramCandidates(discovery));
       });
       return;
     }

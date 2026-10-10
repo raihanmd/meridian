@@ -426,7 +426,7 @@ const BOT_COMMANDS = [
   { command: "settings",   description: "Button menu for common config" },
   { command: "setcfg",     description: "Update persisted config key" },
   { command: "screen",     description: "Refresh deterministic candidate list" },
-  { command: "candidates", description: "Show latest cached candidates" },
+  { command: "candidates", description: "Refresh pools matching screening config" },
   { command: "deploy",     description: "Deploy candidate by cached index" },
   { command: "briefing",   description: "Morning briefing" },
   { command: "hive",       description: "HiveMind sync status" },

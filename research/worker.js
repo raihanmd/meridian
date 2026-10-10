@@ -6,13 +6,15 @@ import { config, reloadScreeningThresholds } from "../config.js";
 import { discoverPools } from "../tools/screening.js";
 import { sendMessage } from "../telegram.js";
 import { SOL_MINT } from "../token-allowlist.js";
-import { DEFAULT_RESEARCH_DIR, enqueuePool, listJobs, readReport, saveJob, saveReport } from "./queue.js";
+import { DEFAULT_RESEARCH_DIR, enqueuePool, listJobs, readJudgment, readReport, saveJob, saveJudgment, saveReport } from "./queue.js";
 import { runHermesResearch } from "./hermes.js";
+import { formatJudgment, judgeSkillAvailable, runHermesJudgment } from "./judge.js";
 import { formatReport, splitTelegram } from "./report.js";
 
 const ROOT = process.env.RESEARCH_DIR || DEFAULT_RESEARCH_DIR;
 const INTERVAL_MS = Math.max(60_000, Number(config.schedule.screeningIntervalMin || 40) * 60_000);
 const MAX_RESEARCH_ATTEMPTS = 5;
+const MAX_JUDGE_ATTEMPTS = 3;
 const RETRY_BASE_MS = 60_000;
 let stopping = false;
 
@@ -82,6 +84,63 @@ export async function processResearchJobs(root = ROOT, { research = runHermesRes
   }
 }
 
+export async function processJudgmentJobs(root = ROOT, { judge = runHermesJudgment, send = sendMessage, now = Date.now, maxJobs = Infinity, signal } = {}) {
+  const jobs = await listJobs(root);
+  let processed = 0;
+  for (const job of jobs) {
+    if (stopping || processed >= maxJobs) break;
+    if (job.status !== "sent" || job.judgment?.status === "sent" || job.judgment?.status === "failed") continue;
+    const current = now();
+    job.judgment ||= { status: "pending", attempts: 0, nextAttemptAt: current, deliveryAttempts: 0, nextDeliveryAt: current, deliveredParts: 0 };
+    const state = job.judgment;
+    if ((state.status === "pending" || state.status === "running") && (state.nextAttemptAt || 0) <= current) {
+      processed++;
+      state.status = "running";
+      await saveJob(root, job);
+      try {
+        const report = await readReport(root, job.mint);
+        const judgment = await judge(report, { root, signal });
+        await saveJudgment(root, job.mint, judgment);
+        state.status = "ready";
+        state.nextDeliveryAt = current;
+        state.error = null;
+        await saveJob(root, job);
+      } catch (error) {
+        if (signal?.aborted) break;
+        state.attempts++;
+        state.status = state.attempts >= MAX_JUDGE_ATTEMPTS ? "failed" : "pending";
+        state.nextAttemptAt = current + retryDelay(state.attempts);
+        state.error = String(error.message || error).slice(0, 500);
+        await saveJob(root, job);
+        continue;
+      }
+    }
+    if (state.status !== "ready" || (state.nextDeliveryAt || 0) > now()) continue;
+    if (processed === 0) processed++;
+    try {
+      const report = await readReport(root, job.mint);
+      const judgment = await readJudgment(root, job.mint);
+      const parts = splitTelegram(formatJudgment(judgment, report));
+      for (let i = state.deliveredParts || 0; i < parts.length; i++) {
+        const response = await send(parts.length > 1 ? `[${i + 1}/${parts.length}]\n${parts[i]}` : parts[i], { timeoutMs: 20_000 });
+        if (!response?.ok) throw new Error("Telegram did not confirm judgment delivery");
+        state.deliveredParts = i + 1;
+        await saveJob(root, job);
+      }
+      state.status = "sent";
+      state.sentAt = new Date(now()).toISOString();
+      state.error = null;
+      await saveJob(root, job);
+    } catch (error) {
+      state.deliveryAttempts++;
+      state.nextDeliveryAt = now() + retryDelay(state.deliveryAttempts);
+      state.error = String(error.message || error).slice(0, 500);
+      await saveJob(root, job);
+    }
+  }
+  return processed;
+}
+
 async function acquireLock(root) {
   await fs.mkdir(root, { recursive: true });
   const file = path.join(root, "worker.lock");
@@ -108,6 +167,7 @@ export async function main() {
   process.on("SIGTERM", stop);
   try {
     let nextScanAt = 0;
+    let warnedMissingJudge = false;
     while (!stopping) {
       if (Date.now() >= nextScanAt) {
         try {
@@ -120,6 +180,15 @@ export async function main() {
       }
       try { await processResearchJobs(ROOT, { maxJobs: 1, signal: controller.signal }); }
       catch (error) { console.error(`[RESEARCH] Queue failed: ${error.message}`); }
+      try {
+        if (await judgeSkillAvailable()) {
+          warnedMissingJudge = false;
+          await processJudgmentJobs(ROOT, { maxJobs: 1, signal: controller.signal });
+        } else if (!warnedMissingJudge) {
+          console.warn("[RESEARCH] Syariah Judge skill belum terpasang di Hermes VPS; laporan riset tetap berjalan, penilaian menunggu skill tersedia.");
+          warnedMissingJudge = true;
+        }
+      } catch (error) { console.error(`[RESEARCH] Judgment queue failed: ${error.message}`); }
       if (!stopping) await new Promise((resolve) => {
         const stop = () => { clearTimeout(timer); finish(); };
         const finish = () => {

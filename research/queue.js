@@ -92,3 +92,18 @@ export async function saveReport(root, mint, report) {
 export async function readReport(root, mint) {
   return JSON.parse(await fs.readFile(path.join(jobPath(root, mint), "report.json"), "utf8"));
 }
+
+export async function saveJudgment(root, mint, judgment) {
+  const dir = jobPath(root, mint);
+  const temp = path.join(dir, `judgment.${process.pid}.${Date.now()}.tmp`);
+  try {
+    await fs.writeFile(temp, JSON.stringify(judgment, null, 2), { flag: "wx", mode: 0o600 });
+    await fs.rename(temp, path.join(dir, "judgment.json"));
+  } finally {
+    await fs.rm(temp, { force: true });
+  }
+}
+
+export async function readJudgment(root, mint) {
+  return JSON.parse(await fs.readFile(path.join(jobPath(root, mint), "judgment.json"), "utf8"));
+}
