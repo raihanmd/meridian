@@ -39,6 +39,12 @@ export async function announceResearchHeartbeat(jobs, send = sendMessage) {
   if (!response?.ok) throw new Error("Telegram did not confirm research heartbeat delivery");
 }
 
+function notificationPart(kind, report, part, index, total) {
+  const label = kind === "research" ? "🔬 RISET TOKEN" : "⚖️ KAJIAN SYARIAH";
+  const symbol = report.discoveredSymbol || report.mint;
+  return `${label} · ${symbol}${total > 1 ? ` (${index + 1}/${total})` : ""}\n\n${part}`;
+}
+
 export async function requeueLegacyUnverifiedReports(root = ROOT, now = Date.now()) {
   let requeued = 0;
   for (const job of await listJobs(root)) {
@@ -97,7 +103,7 @@ export async function processResearchJobs(root = ROOT, { research = runHermesRes
       const report = await readReport(root, job.mint);
       const parts = splitTelegram(formatReport(report));
       for (let i = job.deliveredParts || 0; i < parts.length; i++) {
-        const response = await send(parts.length > 1 ? `[${i + 1}/${parts.length}]\n${parts[i]}` : parts[i], { timeoutMs: 20_000 });
+        const response = await send(notificationPart("research", report, parts[i], i, parts.length), { timeoutMs: 20_000 });
         if (!response?.ok) throw new Error("Telegram did not confirm delivery");
         job.deliveredParts = i + 1;
         await saveJob(root, job);
@@ -157,7 +163,7 @@ export async function processJudgmentJobs(root = ROOT, { judge = runHermesJudgme
       const judgment = await readJudgment(root, job.mint);
       const parts = splitTelegram(formatJudgment(judgment, report));
       for (let i = state.deliveredParts || 0; i < parts.length; i++) {
-        const response = await send(parts.length > 1 ? `[${i + 1}/${parts.length}]\n${parts[i]}` : parts[i], { timeoutMs: 20_000 });
+        const response = await send(notificationPart("judgment", report, parts[i], i, parts.length), { timeoutMs: 20_000 });
         if (!response?.ok) throw new Error("Telegram did not confirm judgment delivery");
         state.deliveredParts = i + 1;
         await saveJob(root, job);

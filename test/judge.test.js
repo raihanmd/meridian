@@ -84,10 +84,11 @@ test("judgment retries independently after the research report was sent", async 
   let now = 1_000;
   let judgeCalls = 0;
   let sendCalls = 0;
+  const notifications = [];
   const options = {
     now: () => now,
     judge: async () => { judgeCalls++; if (judgeCalls === 1) throw new Error("temporary error"); return parseJudgment(JSON.stringify(judgment()), report()); },
-    send: async () => { sendCalls++; return sendCalls === 1 ? null : { ok: true }; },
+    send: async (text) => { notifications.push(text); sendCalls++; return sendCalls === 1 ? null : { ok: true }; },
   };
   await processJudgmentJobs(root, options);
   let [job] = await listJobs(root);
@@ -104,6 +105,7 @@ test("judgment retries independently after the research report was sent", async 
   assert.equal(job.judgment.status, "sent");
   assert.equal(judgeCalls, 2);
   assert.equal(sendCalls, 2);
+  assert.ok(notifications.every((text) => text.startsWith("⚖️ KAJIAN SYARIAH · EX")));
 });
 
 test("failed judgment remains inspectable and can be retried manually", async (t) => {

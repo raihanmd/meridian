@@ -1345,7 +1345,7 @@ async function runDeterministicScreen() {
 
 async function sendScreeningText(text) {
   const sendChunk = async (chunk) => {
-    const result = await sendMessage(chunk, { timeoutMs: 15000 });
+    const result = await sendMessage(`🔎 KANDIDAT POOL · OBSERVASI\n\n${chunk}`, { timeoutMs: 15000 });
     if (!result?.ok) throw new Error("Could not deliver candidate list to Telegram; check Telegram settings and logs.");
   };
   let chunk = "";

@@ -348,4 +348,6 @@ test("Telegram retries resume at the first undelivered report part", async (t) =
   assert.equal(job.status, "sent");
   assert.equal(sent[1], sent[2]);
   assert.notEqual(sent[0], sent[2]);
+  assert.ok(sent.every((text) => text.startsWith("🔬 RISET TOKEN · DARK (")));
+  assert.ok(sent.every((text) => text.length <= 4096));
 });
