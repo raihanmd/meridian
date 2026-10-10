@@ -1,0 +1,33 @@
+import { PublicKey } from "@solana/web3.js";
+
+export const SOL_MINT = "So11111111111111111111111111111111111111112";
+
+export function normalizeTokenAllowlist(value) {
+  if (!Array.isArray(value)) {
+    throw new Error("tokenAllowlist must be an array of { name, mint } objects");
+  }
+  return value.map((entry, index) => {
+    const name = entry?.name;
+    const mint = entry?.mint;
+    if (typeof name !== "string" || !name.trim() || typeof mint !== "string") {
+      throw new Error(`tokenAllowlist[${index}] must contain a name and mint`);
+    }
+    try {
+      if (new PublicKey(mint).toBase58() !== mint) throw new Error("noncanonical mint");
+    } catch {
+      throw new Error(`tokenAllowlist[${index}] has an invalid mint`);
+    }
+    return { name: name.trim(), mint };
+  });
+}
+
+export function getPoolRestrictionReason(baseMint, quoteMint, allowlist) {
+  if (!baseMint || !quoteMint) return "pool token mints are missing";
+  if (quoteMint !== SOL_MINT) return "token Y must be SOL for single-sided SOL deploys";
+  if (allowlist.length === 0) return null;
+  const allowed = new Set(allowlist.map((entry) => entry.mint));
+  if (!allowed.has(baseMint) || !allowed.has(quoteMint)) {
+    return "both pool token mints must be in tokenAllowlist";
+  }
+  return null;
+}

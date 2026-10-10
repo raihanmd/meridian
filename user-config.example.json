@@ -41,6 +41,7 @@
   "maxTop10Pct": 60,
   "allowedLaunchpads": [],
   "blockedLaunchpads": [],
+  "tokenAllowlist": [],
   "minTokenAgeHours": null,
   "maxTokenAgeHours": null,
 

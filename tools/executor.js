@@ -26,6 +26,7 @@ import fs from "fs";
 import { execSync, spawn } from "child_process";
 import { REPO_ROOT, repoPath } from "../repo-root.js";
 import { normalizeTimeframe, scaleScreeningToTimeframe } from "../screening-scales.js";
+import { getPoolRestrictionReason } from "../token-allowlist.js";
 
 const USER_CONFIG_PATH = repoPath("user-config.json");
 const POOL_DISCOVERY_BASE = "https://pool-discovery-api.datapi.meteora.ag";
@@ -91,6 +92,11 @@ async function validateDeployPoolThresholds(args) {
       reason: `Could not verify pool screening thresholds before deploy: ${error.message}`,
     };
   }
+
+  const baseMint = detail?.token_x?.address || detail?.base_token_address || null;
+  const quoteMint = detail?.token_y?.address || detail?.quote_token_address || null;
+  const poolRestriction = getPoolRestrictionReason(baseMint, quoteMint, config.screening.tokenAllowlist);
+  if (poolRestriction) return { pass: false, reason: `Pool blocked: ${poolRestriction}.` };
 
   const tvl = poolDetailTvl(detail);
   const minTvl = numberOrNull(config.screening.minTvl);
@@ -164,7 +170,6 @@ async function validateDeployPoolThresholds(args) {
     };
   }
 
-  const baseMint = detail?.token_x?.address || detail?.base_token_address || null;
   const entryMarketData = {
     entry_mcap: numberOrNull(detail?.token_x?.market_cap ?? detail?.base_token_market_cap),
     entry_tvl: tvl,

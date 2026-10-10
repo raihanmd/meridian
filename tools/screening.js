@@ -5,6 +5,7 @@ import { log } from "../logger.js";
 import { isBaseMintOnCooldown, isPoolOnCooldown } from "../pool-memory.js";
 import { confirmIndicatorPreset } from "./chart-indicators.js";
 import { getAgentMeridianBase, getAgentMeridianHeaders } from "./agent-meridian.js";
+import { getPoolRestrictionReason } from "../token-allowlist.js";
 
 const DATAPI_JUP = "https://datapi.jup.ag/v1";
 
@@ -466,10 +467,21 @@ export async function discoverPools({
     }
   }
 
-  rawPools = await applyVolatilityTimeframe(rawPools, s.timeframe);
+  const filteredExamples = [];
+  // Check mint addresses before ranking or fetching longer-timeframe details.
+  const restrictedPools = rawPools.filter((pool) => {
+    const reason = getPoolRestrictionReason(
+      getPoolBaseMint(pool),
+      pool?.token_y?.address || pool?.quote_token_address || pool?.quote_mint,
+      s.tokenAllowlist,
+    );
+    if (!reason) return true;
+    filteredExamples.push({ name: pool.name || pool.pool_address || "unknown pool", reason });
+    return false;
+  });
+  rawPools = await applyVolatilityTimeframe(restrictedPools, s.timeframe);
   await enrichDiscordSignalLaunchpads(rawPools);
 
-  const filteredExamples = [];
   const thresholdedRawPools = rawPools.filter((pool) => {
     const reason = getRawPoolScreeningRejectReason(pool, s);
     if (!reason) return true;

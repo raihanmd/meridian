@@ -488,6 +488,18 @@ All fields are optional — defaults shown. Edit `user-config.json`.
 | `maxBotHoldersPct` | `30` | Maximum bot holder % (Jupiter audit) |
 | `maxTop10Pct` | `60` | Maximum top-10 holder concentration |
 | `blockedLaunchpads` | `[]` | Launchpad names to never deploy into |
+| `tokenAllowlist` | `[]` | Token mints permitted on both sides of a pool; an empty list disables this filter |
+
+Set `tokenAllowlist` in `user-config.json` to an array of `{ "name", "mint" }` objects. For example, to consider only GHOST/SOL pools:
+
+```json
+"tokenAllowlist": [
+  { "name": "GHOST", "mint": "BBKPiLM9KjdJW7oQSKt99RVWcZdhF6sEHRKnwqeBGHST" },
+  { "name": "SOL", "mint": "So11111111111111111111111111111111111111112" }
+]
+```
+
+Meridian deploys only single-sided SOL into token Y, so eligible pools must have SOL as token Y even when the allowlist contains other quote tokens. The screener checks both mint addresses before ranking candidates. Deploy checks them again against fresh pool details and on-chain pool data. Edit the file and restart the bot to change the list; the AI `update_config` tool cannot change it.
 
 ### Management
 
