@@ -124,11 +124,11 @@ test("Hermes receives a prompt file and only the web toolset, without Meridian w
   };
   const result = await runHermesResearch({ mint: MINT, symbol: "DARK", pool: "pool" }, { root, spawnFn });
   assert.equal(result.mint, MINT);
-  assert.equal(result.webSearchVerified, true);
+  assert.equal(result.webAccessCheck, "tool-result");
   assert.match(await fs.readFile(path.join(root, MINT, "prompt.txt"), "utf8"), /EXACT mint/);
 });
 
-test("Hermes retries a rejected CLI flag with a basic one-shot command", async (t) => {
+test("older Hermes CLI accepts only a sourced plain one-shot report", async (t) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "meridian-research-"));
   t.after(() => fs.rm(root, { recursive: true, force: true }));
   await enqueuePool(root, pool(MINT));
@@ -147,9 +147,8 @@ test("Hermes retries a rejected CLI flag with a basic one-shot command", async (
       } else {
         assert.deepEqual(args.slice(0, 3), ["chat", "-Q", "-q"]);
         assert.equal(args[args.indexOf("--toolsets") + 1], "web");
-        assert.equal(args[args.indexOf("--format") + 1], "stream-json");
-        child.stdout.write(JSON.stringify({ type: "tool_result", name: "web_search", is_error: false, output: '{"success":true}' }) + "\n");
-        child.stdout.write(JSON.stringify({ type: "result", exit_code: 0, text: JSON.stringify(report()) }) + "\n");
+        assert.equal(args.includes("--format"), false);
+        child.stdout.write(`${JSON.stringify(report())}\n\nsession_id: 20261010_173501_63825b\n`);
         child.emit("close", 0);
       }
     });
@@ -157,6 +156,58 @@ test("Hermes retries a rejected CLI flag with a basic one-shot command", async (
   };
   const result = await runHermesResearch({ mint: MINT, symbol: "DARK", pool: "pool" }, { root, spawnFn });
   assert.equal(result.mint, MINT);
+  assert.equal(result.webAccessCheck, "legacy-cli-sourced");
+  assert.equal(calls, 2);
+});
+
+test("older Hermes CLI cannot complete a source-less research report", async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "meridian-research-"));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  await enqueuePool(root, pool(MINT));
+  let calls = 0;
+  const spawnFn = () => {
+    const child = new EventEmitter();
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.kill = () => {};
+    queueMicrotask(() => {
+      calls++;
+      if (calls === 1) {
+        child.stderr.write("hermes: error: unrecognized arguments: --format stream-json\n");
+        child.emit("close", 2);
+      } else {
+        child.stdout.write(JSON.stringify({ ...report(), sources: [] }));
+        child.emit("close", 0);
+      }
+    });
+    return child;
+  };
+  await assert.rejects(runHermesResearch({ mint: MINT, symbol: "DARK", pool: "pool" }, { root, spawnFn }), /legacy CLI returned no sources/);
+  assert.equal(calls, 2);
+});
+
+test("older Hermes CLI reports unavailable web tools as a configuration error", async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "meridian-research-"));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  await enqueuePool(root, pool(MINT));
+  let calls = 0;
+  const spawnFn = () => {
+    const child = new EventEmitter();
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.kill = () => {};
+    queueMicrotask(() => {
+      if (++calls === 1) {
+        child.stderr.write("hermes: error: unrecognized arguments: --format stream-json\n");
+        child.emit("close", 2);
+      } else {
+        child.stdout.write("WEB_UNAVAILABLE\n\nsession_id: 20261010_173501_63825b\n");
+        child.emit("close", 0);
+      }
+    });
+    return child;
+  };
+  await assert.rejects(runHermesResearch({ mint: MINT, symbol: "DARK", pool: "pool" }, { root, spawnFn }), /Hermes web_search is unavailable in CLI mode/);
   assert.equal(calls, 2);
 });
 

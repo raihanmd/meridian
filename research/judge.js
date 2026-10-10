@@ -54,7 +54,7 @@ export function parseJudgment(text, report) {
 
 export async function runHermesJudgment(report, { root, bin, timeoutMs = 60_000, spawnFn, signal } = {}) {
   const promptFile = path.join(jobPath(root, report.mint), "judge-prompt.txt");
-  const text = await runHermesPrompt(promptFile, judgePrompt(report), {
+  const { text } = await runHermesPrompt(promptFile, judgePrompt(report), {
     root, bin, timeoutMs, spawnFn, signal, toolsets: "skills", skills: JUDGE_SKILL, maxTurns: 4, ignoreRules: false,
   });
   return parseJudgment(text, report);

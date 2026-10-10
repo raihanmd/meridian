@@ -46,7 +46,7 @@ export async function requeueLegacyUnverifiedReports(root = ROOT, now = Date.now
     let report;
     try { report = await readReport(root, job.mint); }
     catch { continue; }
-    if (report?.webSearchVerified === true || report?.sources?.length) continue;
+    if (report?.webAccessCheck || report?.sources?.length) continue;
     job.status = "pending";
     job.attempts = 0;
     job.nextAttemptAt = now;
