@@ -8,7 +8,7 @@ import { log } from "./logger.js";
 import { getMyPositions, closePosition, getActiveBin } from "./tools/dlmm.js";
 import { getWalletBalances } from "./tools/wallet.js";
 import { discoverPools, getTopCandidates } from "./tools/screening.js";
-import { formatDryRunDeploy } from "./screening-report.js";
+import { formatAllowlistedPoolDiagnostics, formatDryRunDeploy } from "./screening-report.js";
 import { getPoolAllowlistDisplay, getPoolRestrictionReason } from "./token-allowlist.js";
 import { DEFAULT_RESEARCH_DIR, enqueueResearchCandidates } from "./research/queue.js";
 import { startBackgroundResearchWorker } from "./research/worker.js";
@@ -495,7 +495,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
       + (activeStrategy ? `\nSTRATEGY CONTEXT: ${activeStrategy.name} — entry: ${activeStrategy.entry?.condition || "n/a"} | exit: ${activeStrategy.exit?.notes || "n/a"} | best for: ${activeStrategy.best_for}` : "");
 
     // Fetch top candidates, then recon each sequentially with a small delay to avoid 429s
-    const topCandidates = await getTopCandidates({ limit: 10, discovery: observerDiscovery }).catch((error) => {
+    const topCandidates = await getTopCandidates({ limit: 10, discovery: observerDiscovery, includeFilteredDetails: true }).catch((error) => {
       log("screening_warn", `Deployment candidate evaluation failed: ${error.message}`);
       return null;
     });
@@ -531,19 +531,19 @@ export async function runScreeningCycle({ silent = false } = {}) {
       const launchpad = ti?.launchpad ?? null;
       if (launchpad && config.screening.allowedLaunchpads?.length > 0 && !config.screening.allowedLaunchpads.includes(launchpad)) {
         log("screening", `Skipping ${pool.name} — launchpad ${launchpad} not in allow-list`);
-        filteredOut.push({ name: pool.name, reason: `launchpad ${launchpad} not in allow-list` });
+        filteredOut.push({ name: pool.name, pool: pool.pool, reason: `launchpad ${launchpad} not in allow-list` });
         return false;
       }
       if (launchpad && config.screening.blockedLaunchpads.includes(launchpad)) {
         log("screening", `Skipping ${pool.name} — blocked launchpad (${launchpad})`);
-        filteredOut.push({ name: pool.name, reason: `blocked launchpad (${launchpad})` });
+        filteredOut.push({ name: pool.name, pool: pool.pool, reason: `blocked launchpad (${launchpad})` });
         return false;
       }
       const botPct = ti?.audit?.bot_holders_pct;
       const maxBotHoldersPct = config.screening.maxBotHoldersPct;
       if (botPct != null && maxBotHoldersPct != null && botPct > maxBotHoldersPct) {
         log("screening", `Bot-holder filter: dropped ${pool.name} — bots ${botPct}% > ${maxBotHoldersPct}%`);
-        filteredOut.push({ name: pool.name, reason: `bot holders ${botPct}% > ${maxBotHoldersPct}%` });
+        filteredOut.push({ name: pool.name, pool: pool.pool, reason: `bot holders ${botPct}% > ${maxBotHoldersPct}%` });
         return false;
       }
       return true;
@@ -552,12 +552,18 @@ export async function runScreeningCycle({ silent = false } = {}) {
     if (passing.length === 0) {
       const combined = filteredOut.length > 0 ? filteredOut : earlyFilteredExamples;
       const combinedExamples = combined.slice(0, 3)
-        .map((entry) => `- ${entry.name}: ${entry.reason}`)
+        .map((entry) => `- ${entry.name}${entry.pool ? ` [${entry.pool.slice(0, 8)}]` : ""}: ${entry.reason}`)
         .join("\n");
       screenReport = [
         "No deploy-ready pools in this screening cycle.",
         `${observerDiscovery.pools.length} pool(s) still matched discovery filters for observation.`,
-        ...(combinedExamples ? ["Deployment filter examples:", combinedExamples] : []),
+        formatAllowlistedPoolDiagnostics(
+          observerDiscovery.pools,
+          config.screening.tokenAllowlist,
+          [...(topCandidates.filtered_details || []), ...filteredOut],
+          candidates,
+        ),
+        ...(combinedExamples ? ["First three recorded rejects (token names may repeat):", combinedExamples] : []),
       ].join("\n");
       appendDecision({
         type: "no_deploy",
@@ -1338,7 +1344,7 @@ function formatTelegramCandidates(discovery) {
       const reason = status.baseAllowlisted && status.restriction ? `\n   Deploy blocked: ${status.restriction}` : "";
       return `${i + 1}. ${status.label} ${pool.name} | ${pool.pool}\n   fee/aTVL ${feeTvl} | vol $${vol} | organic ${pool.organic_score ?? "?"}${reason}`;
     });
-    return `Pools matching config: ${candidates.length} (API total: ${discovery.total ?? "?"}, received: ${discovery.screened})\nToken allowlist matched: ${listed} | Deploy ready: ${deployable}\n${listed === 0 ? "No allowlisted base token on this discovery page.\n" : ""}\n${lines.join("\n")}`;
+    return `Pools matching config: ${candidates.length} (API total: ${discovery.total ?? "?"}, received: ${discovery.screened})\nAllowlisted base pools: ${listed} | Allowlisted SOL pairs: ${deployable} (entry checks still pending)\n${listed === 0 ? "No allowlisted base token on this discovery page.\n" : ""}\n${lines.join("\n")}`;
   }
   const examples = (discovery.filtered_examples || []).slice(0, 3)
     .map((entry) => `- ${entry.name}: ${entry.reason}`)

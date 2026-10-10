@@ -26,6 +26,7 @@ test("candidate labels distinguish an approved token from a deployable pair", ()
   const ready = getPoolAllowlistDisplay(GHOST_MINT, SOL_MINT, allowlist);
   assert.equal(ready.deployable, true);
   assert.match(ready.label, /✅ ALLOWLIST/);
+  assert.match(ready.label, /SOL PAIR/);
   const observed = getPoolAllowlistDisplay(GHOST_MINT, USDC_MINT, allowlist);
   assert.equal(observed.baseAllowlisted, true);
   assert.equal(observed.deployable, false);

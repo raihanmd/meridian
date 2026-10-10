@@ -543,7 +543,7 @@ export async function discoverPools({
  * Returns eligible pools for the agent to evaluate and pick from.
  * Hard filters applied in code, agent decides which to deploy into.
  */
-export async function getTopCandidates({ limit = 10, discovery: providedDiscovery } = {}) {
+export async function getTopCandidates({ limit = 10, discovery: providedDiscovery, includeFilteredDetails = false } = {}) {
   const { config } = await import("../config.js");
   const discovery = providedDiscovery ?? await discoverPools({ page_size: 50 });
   const { pools } = discovery;
@@ -678,6 +678,7 @@ export async function getTopCandidates({ limit = 10, discovery: providedDiscover
     total_eligible: eligible.length,
     total_screened: discovery.screened,
     filtered_examples: filteredOut.slice(0, 3),
+    ...(includeFilteredDetails ? { filtered_details: filteredOut } : {}),
   };
 }
 
@@ -782,6 +783,8 @@ function pushFilteredReason(list, pool, reason) {
   if (!list || !pool) return;
   list.push({
     name: pool.name || `${pool.base?.symbol || "?"}-${pool.quote?.symbol || "?"}`,
+    pool: pool.pool || null,
+    baseMint: pool.base?.mint || null,
     reason,
   });
 }

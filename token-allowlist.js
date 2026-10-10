@@ -41,7 +41,7 @@ export function getPoolAllowlistDisplay(baseMint, quoteMint, allowlist) {
     baseAllowlisted,
     deployable: restriction === null,
     restriction,
-    label: restriction === null ? "✅ ALLOWLIST · DEPLOY READY"
+    label: restriction === null ? "✅ ALLOWLIST · SOL PAIR"
       : baseAllowlisted ? "✅ TOKEN ALLOWLIST · 👀 OBSERVE"
       : "👀 OBSERVE",
   };
