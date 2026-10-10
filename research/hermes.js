@@ -20,33 +20,42 @@ export async function runHermesPrompt(promptFile, prompt, { root, bin = process.
   const args = ["chat", "--query-file", promptFile, "--format", "stream-json", "--toolsets", toolsets, "--source", "tool", "--max-turns", String(maxTurns)];
   if (ignoreRules) args.push("--ignore-rules");
   if (skills) args.push("--skills", skills);
-  const result = await new Promise((resolve, reject) => {
-    const child = spawnFn(bin, args, { cwd: root, env: hermesEnv(), stdio: ["ignore", "pipe", "pipe"], signal });
+  const invoke = (argv) => new Promise((resolve, reject) => {
+    const child = spawnFn(bin, argv, { cwd: root, env: hermesEnv(), stdio: ["ignore", "pipe", "pipe"], signal });
     let output = "";
+    let diagnostic = "";
     let killed = false;
     const timer = setTimeout(() => { killed = true; child.kill("SIGKILL"); }, timeoutMs);
     child.stdout.on("data", (chunk) => {
       output += chunk.toString();
       if (output.length > 2_000_000) { killed = true; child.kill("SIGKILL"); }
     });
-    child.stderr.on("data", () => {});
+    child.stderr.on("data", (chunk) => { diagnostic = (diagnostic + chunk.toString()).slice(-2000); });
     child.on("error", (error) => { clearTimeout(timer); reject(error); });
     child.on("close", (code) => {
       clearTimeout(timer);
       if (killed) return reject(new Error("Hermes timed out or exceeded output limit"));
-      if (code !== 0) return reject(new Error(`Hermes exited ${code}; check Hermes model, skill, and tool configuration`));
-      resolve(output);
+      resolve({ code, output, diagnostic: diagnostic.trim().slice(-500) });
     });
   });
+  let result = await invoke(args);
+  if (result.code === 2 && !signal?.aborted) {
+    const fallback = ["chat", "-Q", "-q", prompt, "--toolsets", toolsets];
+    if (skills) fallback.push("--skills", skills);
+    result = await invoke(fallback);
+    if (result.code !== 0) throw new Error(`Hermes exited ${result.code} (compatibility mode): ${result.diagnostic || "no diagnostic"}`);
+    return result.output.trim();
+  }
+  if (result.code !== 0) throw new Error(`Hermes exited ${result.code}: ${result.diagnostic || "no diagnostic"}`);
   let final = null;
-  for (const line of result.split("\n")) {
+  for (const line of result.output.split("\n")) {
     if (!line.trim()) continue;
     let event;
     try { event = JSON.parse(line); } catch { continue; }
     if (event.type === "result") final = event;
   }
   if (!final || final.exit_code !== 0 || typeof final.text !== "string") {
-    throw new Error("Hermes did not return a successful result event");
+    throw new Error(`Hermes did not return a successful result event: ${result.diagnostic || "no diagnostic"}`);
   }
   return final.text;
 }

@@ -96,6 +96,36 @@ test("Hermes receives a prompt file and only the web toolset, without Meridian w
   assert.match(await fs.readFile(path.join(root, MINT, "prompt.txt"), "utf8"), /EXACT mint/);
 });
 
+test("Hermes retries a rejected CLI flag with a basic one-shot command", async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "meridian-research-"));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  await enqueuePool(root, pool(MINT));
+  let calls = 0;
+  const spawnFn = (_bin, args) => {
+    const child = new EventEmitter();
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.kill = () => {};
+    queueMicrotask(() => {
+      calls++;
+      if (calls === 1) {
+        assert.ok(args.includes("--query-file"));
+        child.stderr.write("error: unrecognized arguments: --query-file\n");
+        child.emit("close", 2);
+      } else {
+        assert.deepEqual(args.slice(0, 3), ["chat", "-Q", "-q"]);
+        assert.equal(args[args.indexOf("--toolsets") + 1], "web");
+        child.stdout.write(JSON.stringify(report()));
+        child.emit("close", 0);
+      }
+    });
+    return child;
+  };
+  const result = await runHermesResearch({ mint: MINT, symbol: "DARK", pool: "pool" }, { root, spawnFn });
+  assert.equal(result.mint, MINT);
+  assert.equal(calls, 2);
+});
+
 test("research retries failure and delivery retries from saved report", async (t) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "meridian-research-"));
   t.after(() => fs.rm(root, { recursive: true, force: true }));

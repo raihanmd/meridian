@@ -8,7 +8,7 @@ export const JUDGE_SKILL = "syariah-judge";
 const STATUSES = new Set(["tidak_ditemukan_isu", "perlu_kajian_lanjut", "indikasi_masalah_kuat", "bukti_belum_cukup"]);
 const CONFIDENCE = new Set(["high", "medium", "low", "unknown"]);
 
-export function judgeSkillPath(home = process.env.HERMES_HOME || os.homedir()) {
+export function judgeSkillPath(home = process.env.HERMES_HOME || path.join(os.homedir(), ".hermes")) {
   return path.join(home, "skills", "research", JUDGE_SKILL, "SKILL.md");
 }
 

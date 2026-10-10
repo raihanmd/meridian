@@ -6,7 +6,7 @@ import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import test from "node:test";
 import { enqueuePool, listJobs, readJudgment, saveJob, saveReport } from "../research/queue.js";
-import { judgePrompt, parseJudgment, runHermesJudgment } from "../research/judge.js";
+import { judgePrompt, judgeSkillPath, parseJudgment, runHermesJudgment } from "../research/judge.js";
 import { retryFailedJudgment } from "../research/retry.js";
 import { processJudgmentJobs } from "../research/worker.js";
 import { SOL_MINT } from "../token-allowlist.js";
@@ -51,6 +51,11 @@ test("judge abstains if key fields or cited evidence are missing", () => {
 test("judge prompt distinguishes issuer treasury and token backing", () => {
   assert.match(judgePrompt(report()), /unrelated to holder rights/);
   assert.match(judgePrompt(report()), /token reserves, backing, redemption/);
+});
+
+test("judge skill lookup uses Hermes home rather than the user's home directory", () => {
+  const hermesHome = process.env.HERMES_HOME || path.join(os.homedir(), ".hermes");
+  assert.equal(judgeSkillPath(), path.join(hermesHome, "skills", "research", "syariah-judge", "SKILL.md"));
 });
 
 test("Hermes judgment preloads the VPS skill without web access or Meridian secrets", async (t) => {
