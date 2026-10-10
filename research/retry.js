@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { DEFAULT_RESEARCH_DIR, jobPath, saveJob } from "./queue.js";
+import { DEFAULT_RESEARCH_DIR, jobPath, listJobs, saveJob } from "./queue.js";
 
 export async function retryFailedResearch(mint, root = process.env.RESEARCH_DIR || DEFAULT_RESEARCH_DIR) {
   const dir = jobPath(root, mint);
@@ -12,6 +12,16 @@ export async function retryFailedResearch(mint, root = process.env.RESEARCH_DIR 
   job.nextAttemptAt = Date.now();
   job.error = null;
   await saveJob(root, job);
+}
+
+export async function retryAllFailedResearch(root = process.env.RESEARCH_DIR || DEFAULT_RESEARCH_DIR) {
+  let count = 0;
+  for (const job of await listJobs(root)) {
+    if (job.status !== "failed") continue;
+    await retryFailedResearch(job.mint, root);
+    count++;
+  }
+  return count;
 }
 
 export async function retryFailedJudgment(mint, root = process.env.RESEARCH_DIR || DEFAULT_RESEARCH_DIR) {
@@ -29,8 +39,9 @@ export async function retryFailedJudgment(mint, root = process.env.RESEARCH_DIR 
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const judge = process.argv[2] === "--judge";
-  (judge ? retryFailedJudgment(process.argv[3]) : retryFailedResearch(process.argv[2])).then(
-    () => console.log(`${judge ? "Judgment" : "Research"} job queued for retry`),
+  const all = !judge && process.argv[2] === "--all";
+  (judge ? retryFailedJudgment(process.argv[3]) : all ? retryAllFailedResearch() : retryFailedResearch(process.argv[2])).then(
+    (count) => console.log(all ? `${count} failed research job(s) queued for retry` : `${judge ? "Judgment" : "Research"} job queued for retry`),
     (error) => { console.error(error.message); process.exitCode = 1; },
   );
 }

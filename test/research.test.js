@@ -8,7 +8,7 @@ import test from "node:test";
 import { enqueuePool, enqueueResearchCandidates, listJobs, readReport, saveJob, saveReport } from "../research/queue.js";
 import { hermesEnv, runHermesResearch } from "../research/hermes.js";
 import { parseReport, splitTelegram } from "../research/report.js";
-import { retryFailedResearch } from "../research/retry.js";
+import { retryAllFailedResearch, retryFailedResearch } from "../research/retry.js";
 import { announceResearchHeartbeat, formatResearchHeartbeat, processResearchJobs, requeueLegacyUnverifiedReports } from "../research/worker.js";
 import { SOL_MINT } from "../token-allowlist.js";
 
@@ -302,6 +302,25 @@ test("exhausted research remains inspectable and can be manually retried", async
   [job] = await listJobs(root);
   assert.equal(job.status, "pending");
   assert.equal(job.attempts, 0);
+});
+
+test("bulk retry only requeues failed research jobs", async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "meridian-research-"));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  await enqueuePool(root, pool(MINT), 1_000);
+  await enqueuePool(root, pool(OTHER), 2_000);
+  const jobs = await listJobs(root);
+  jobs[0].status = "failed";
+  jobs[0].attempts = 5;
+  jobs[0].error = "web unavailable";
+  await saveJob(root, jobs[0]);
+  assert.equal(await retryAllFailedResearch(root), 1);
+  const [retried, untouched] = await listJobs(root);
+  assert.equal(retried.status, "pending");
+  assert.equal(retried.attempts, 0);
+  assert.equal(retried.error, null);
+  assert.equal(untouched.status, "pending");
+  assert.equal(await retryAllFailedResearch(root), 0);
 });
 
 test("Telegram retries resume at the first undelivered report part", async (t) => {
