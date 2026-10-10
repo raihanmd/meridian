@@ -16,7 +16,7 @@ test("allowlist requires canonical mint objects and both sides of a SOL pair", (
   assert.equal(getPoolRestrictionReason(GHOST_MINT, SOL_MINT, allowlist), null);
   assert.match(getPoolRestrictionReason(USDC_MINT, SOL_MINT, allowlist), /both pool token mints/);
   assert.match(getPoolRestrictionReason(GHOST_MINT, USDC_MINT, allowlist), /token Y must be SOL/);
-  assert.equal(getPoolRestrictionReason(GHOST_MINT, SOL_MINT, []), null);
+  assert.match(getPoolRestrictionReason(GHOST_MINT, SOL_MINT, []), /tokenAllowlist is empty/);
   assert.throws(() => normalizeTokenAllowlist([{ name: "bad", mint: "bad mint" }]), /invalid mint/);
   assert.throws(() => normalizeTokenAllowlist("GHOST"), /must be an array/);
 });
@@ -100,7 +100,11 @@ test("deploy tool blocks a pool outside the allowlist before wallet checks", asy
     const result = await executeTool("deploy_position", { pool_address: "blocked" });
     assert.equal(result.blocked, true);
     assert.match(result.reason, /both pool token mints/);
-    assert.equal(calls, 1);
+    config.screening.tokenAllowlist = [];
+    const emptyResult = await executeTool("deploy_position", { pool_address: "blocked" });
+    assert.equal(emptyResult.blocked, true);
+    assert.match(emptyResult.reason, /tokenAllowlist is empty/);
+    assert.equal(calls, 2);
   } finally {
     config.screening.tokenAllowlist = originalAllowlist;
     globalThis.fetch = originalFetch;

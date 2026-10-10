@@ -29,6 +29,7 @@ signal-weights.json
 
 # Logs
 logs/
+data/token-research/
 
 # OS
 .DS_Store

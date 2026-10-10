@@ -24,7 +24,9 @@ export function normalizeTokenAllowlist(value) {
 export function getPoolRestrictionReason(baseMint, quoteMint, allowlist) {
   if (!baseMint || !quoteMint) return "pool token mints are missing";
   if (quoteMint !== SOL_MINT) return "token Y must be SOL for single-sided SOL deploys";
-  if (allowlist.length === 0) return null;
+  if (!Array.isArray(allowlist) || allowlist.length === 0) {
+    return "tokenAllowlist is empty; no token is approved for deployment";
+  }
   const allowed = new Set(allowlist.map((entry) => entry.mint));
   if (!allowed.has(baseMint) || !allowed.has(quoteMint)) {
     return "both pool token mints must be in tokenAllowlist";

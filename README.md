@@ -491,7 +491,7 @@ All fields are optional — defaults shown. Edit `user-config.json`.
 | `maxBotHoldersPct` | `30` | Maximum bot holder % (Jupiter audit) |
 | `maxTop10Pct` | `60` | Maximum top-10 holder concentration |
 | `blockedLaunchpads` | `[]` | Launchpad names to never deploy into |
-| `tokenAllowlist` | `[]` | Token mints permitted for deployment on both sides of a pool; an empty list permits any SOL-quoted pool |
+| `tokenAllowlist` | `[]` | Token mints permitted for deployment on both sides of a pool; an empty list blocks every deploy |
 
 Set `tokenAllowlist` in `user-config.json` to an array of `{ "name", "mint" }` objects. For example, to deploy only to GHOST/SOL pools:
 
@@ -503,6 +503,20 @@ Set `tokenAllowlist` in `user-config.json` to an array of `{ "name", "mint" }` o
 ```
 
 Meridian deploys only single-sided SOL into token Y, so deploy candidates must have SOL as token Y even when the allowlist contains other quote tokens. Startup, terminal `/candidates`, and Telegram `/screen` show every pool returned by the current discovery page that passes the screening settings, marking pools outside the deployment allowlist as `OBSERVE`. Autonomous selection considers only `ALLOWLIST` pools. Manual deploys are blocked for `OBSERVE` pools too; the deploy path checks fresh pool details and on-chain pool data. Edit the file and restart the bot to change the list; the AI `update_config` tool cannot change it.
+
+### Asynchronous token research
+
+The separate `meridian-research` PM2 process scans the same discovery filters every `screeningIntervalMin` minutes. It queues each new base token mint once, including `OBSERVE` tokens, and invokes Hermes with only the `web` toolset. Trading and position management never wait for research. Reports are saved under `data/token-research/<mint>/report.json` and sent to the configured Telegram chat. Review the report and its source URLs yourself, then add approved mints to `tokenAllowlist` (including SOL for SOL pairs) and restart `meridian`. An empty `tokenAllowlist` is the safest initial setting: it keeps pool discovery and research active while blocking every deployment.
+
+Queue state is stored under `data/token-research/<mint>/job.json`. A failed Hermes run retries up to five times with backoff; `failed` jobs remain on disk for inspection and can be queued again with `npm run research:retry -- <MINT>` after the cause is fixed. Telegram delivery retries independently from the saved report until acknowledged. A process crash can cause a duplicate Telegram message if it happens after Telegram accepts a message but before the delivery state is saved. Multiple pools for the same mint share one research job. Discovery currently sees the first page of up to 50 pools per scan, so the worker cannot guarantee coverage beyond that page.
+
+On the VPS, run `hermes tools`, enable **Web Search & Scraping**, and choose a provider that supports both `web_search` and `web_extract` (for example Firecrawl). Check it with:
+
+```bash
+hermes chat --toolsets web -q "Find the official Solana website and cite its source URL" --format stream-json
+```
+
+Hermes must be available to the same Linux user as PM2. Its model and web credentials should be configured in Hermes itself. Check `command -v hermes`; if PM2 cannot find the executable, set `HERMES_BIN` to that absolute path in the PM2 environment. `npm run pm2:start` starts both `meridian` and `meridian-research`; on an existing PM2 installation, run `pm2 start ecosystem.config.cjs --only meridian-research` once. `npm run start` starts only trading. For a manual worker run, use `npm run research:start`. Inspect `pm2 logs meridian-research --lines 100` and the queue files if a report does not arrive. The worker passes only basic process environment to Hermes, so wallet and Telegram secrets from Meridian are not passed to the research subprocess. It does not use research conclusions to deploy automatically.
 
 ### Management
 

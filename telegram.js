@@ -96,13 +96,16 @@ export function isEnabled() {
   return !!TOKEN;
 }
 
-async function postTelegram(method, body) {
+async function postTelegram(method, body, { timeoutMs } = {}) {
   if (!TOKEN || !chatId) return null;
+  const controller = timeoutMs ? new AbortController() : null;
+  const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
   try {
     const res = await fetch(`${BASE}/${method}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ chat_id: chatId, ...body }),
+      ...(controller ? { signal: controller.signal } : {}),
     });
     if (!res.ok) {
       const err = await res.text();
@@ -117,6 +120,8 @@ async function postTelegram(method, body) {
   } catch (e) {
     log("telegram_error", `${method} failed: ${e.message}`);
     return null;
+  } finally {
+    if (timer) clearTimeout(timer);
   }
 }
 
@@ -144,9 +149,9 @@ async function postTelegramRaw(method, body) {
   }
 }
 
-export async function sendMessage(text) {
+export async function sendMessage(text, options) {
   if (!TOKEN || !chatId) return;
-  return postTelegram("sendMessage", { text: String(text).slice(0, 4096) });
+  return postTelegram("sendMessage", { text: String(text).slice(0, 4096) }, options);
 }
 
 export async function sendMessageWithButtons(text, inlineKeyboard) {
