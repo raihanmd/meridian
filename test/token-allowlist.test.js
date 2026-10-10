@@ -21,7 +21,7 @@ test("allowlist requires canonical mint objects and both sides of a SOL pair", (
   assert.throws(() => normalizeTokenAllowlist("GHOST"), /must be an array/);
 });
 
-test("discovery filters non-allowlisted pools before ranking candidates", async () => {
+test("discovery keeps pools outside the allowlist for manual screening", async () => {
   const screening = config.screening;
   const original = { ...screening };
   const originalFetch = globalThis.fetch;
@@ -67,8 +67,9 @@ test("discovery filters non-allowlisted pools before ranking candidates", async 
     // Remove USDC as an allowed base while keeping the quote restriction explicit.
     screening.tokenAllowlist = screening.tokenAllowlist.filter((entry) => entry.mint !== USDC_MINT);
     const result = await discoverPools();
-    assert.deepEqual(result.pools.map((candidate) => candidate.pool), ["allowed"]);
-    assert.equal(result.filtered_examples.length, 2);
+    assert.deepEqual(result.pools.map((candidate) => candidate.pool), ["allowed", "blocked-base", "blocked-quote"]);
+    assert.equal(result.screened, 3);
+    assert.equal(result.filtered_examples.length, 0);
     assert.equal(calls, 1);
   } finally {
     Object.assign(screening, original);

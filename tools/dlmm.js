@@ -1168,7 +1168,7 @@ export async function getMyPositions({ force = false, silent = false, wallet_add
     // fully public resources. Falls through to the Meteora-API path on any error.
     if (config.pnl.source === "rpc") {
       try {
-        if (!silent) log("positions", `Computing PnL from RPC (${config.pnl.rpcUrl})...`);
+        if (!silent) log("positions", `Computing PnL from RPC (${new URL(config.pnl.rpcUrl).host})...`);
         const rpcResult = await computePositions(walletAddress);
         if (useLocalWallet) {
           syncOpenPositions(rpcResult.positions.map((p) => p.position));
@@ -1177,7 +1177,8 @@ export async function getMyPositions({ force = false, silent = false, wallet_add
         }
         return rpcResult;
       } catch (error) {
-        log("positions_warn", `RPC PnL path failed; falling back to Meteora portfolio API: ${error.message}`);
+        const safeMessage = String(error.message).replaceAll(config.pnl.rpcUrl, "[PnL RPC URL]");
+        log("positions_warn", `RPC PnL path failed; falling back to Meteora portfolio API: ${safeMessage}`);
       }
     }
 

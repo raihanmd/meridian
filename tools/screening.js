@@ -467,19 +467,9 @@ export async function discoverPools({
     }
   }
 
+  const screenedCount = rawPools.length;
   const filteredExamples = [];
-  // Check mint addresses before ranking or fetching longer-timeframe details.
-  const restrictedPools = rawPools.filter((pool) => {
-    const reason = getPoolRestrictionReason(
-      getPoolBaseMint(pool),
-      pool?.token_y?.address || pool?.quote_token_address || pool?.quote_mint,
-      s.tokenAllowlist,
-    );
-    if (!reason) return true;
-    filteredExamples.push({ name: pool.name || pool.pool_address || "unknown pool", reason });
-    return false;
-  });
-  rawPools = await applyVolatilityTimeframe(restrictedPools, s.timeframe);
+  rawPools = await applyVolatilityTimeframe(rawPools, s.timeframe);
   await enrichDiscordSignalLaunchpads(rawPools);
 
   const thresholdedRawPools = rawPools.filter((pool) => {
@@ -543,6 +533,7 @@ export async function discoverPools({
 
   return {
     total: data.total,
+    screened: screenedCount,
     pools,
     filtered_examples: filteredExamples,
   };
@@ -569,6 +560,11 @@ export async function getTopCandidates({ limit = 10 } = {}) {
 
   const eligible = pools
     .filter((p) => {
+      const restriction = getPoolRestrictionReason(p.base?.mint, p.quote?.mint, config.screening.tokenAllowlist);
+      if (restriction) {
+        pushFilteredReason(filteredOut, p, restriction);
+        return false;
+      }
       const tvl = Number(p.tvl ?? p.active_tvl ?? 0);
       if (Number.isFinite(minTvl) && minTvl > 0 && tvl < minTvl) {
         pushFilteredReason(filteredOut, p, `TVL $${tvl} below minTvl $${minTvl}`);
@@ -679,7 +675,8 @@ export async function getTopCandidates({ limit = 10 } = {}) {
 
   return {
     candidates: eligible,
-    total_screened: pools.length,
+    total_eligible: eligible.length,
+    total_screened: discovery.screened,
     filtered_examples: filteredOut.slice(0, 3),
   };
 }

@@ -88,6 +88,7 @@ Create `.env`:
 ```env
 WALLET_PRIVATE_KEY=your_base58_private_key
 RPC_URL=https://mainnet.helius-rpc.com/?api-key=YOUR_KEY
+PNL_RPC_URL=https://mainnet.helius-rpc.com/?api-key=YOUR_KEY
 OPENROUTER_API_KEY=sk-or-...
 HELIUS_API_KEY=your_helius_key          # for wallet balance lookups
 TELEGRAM_BOT_TOKEN=123456:ABC...        # optional — for notifications + chat
@@ -96,6 +97,8 @@ DRY_RUN=true                            # set false for live trading
 ```
 
 > Never put your private key or API keys in `user-config.json` — use `.env` only. Both files are gitignored.
+
+`RPC_URL` and `PNL_RPC_URL` are separate. Position/PnL reads default to `https://pump.helius-rpc.com` unless `PNL_RPC_URL` is set. A nonempty `pnlRpcUrl` in `user-config.json` overrides `PNL_RPC_URL`. The PnL poller runs every 3 seconds by default, so choose an RPC plan that supports the expected request volume.
 
 Optional encrypted `.env` flow:
 
@@ -488,9 +491,9 @@ All fields are optional — defaults shown. Edit `user-config.json`.
 | `maxBotHoldersPct` | `30` | Maximum bot holder % (Jupiter audit) |
 | `maxTop10Pct` | `60` | Maximum top-10 holder concentration |
 | `blockedLaunchpads` | `[]` | Launchpad names to never deploy into |
-| `tokenAllowlist` | `[]` | Token mints permitted on both sides of a pool; an empty list disables this filter |
+| `tokenAllowlist` | `[]` | Token mints permitted for deployment on both sides of a pool; an empty list permits any SOL-quoted pool |
 
-Set `tokenAllowlist` in `user-config.json` to an array of `{ "name", "mint" }` objects. For example, to consider only GHOST/SOL pools:
+Set `tokenAllowlist` in `user-config.json` to an array of `{ "name", "mint" }` objects. For example, to deploy only to GHOST/SOL pools:
 
 ```json
 "tokenAllowlist": [
@@ -499,7 +502,7 @@ Set `tokenAllowlist` in `user-config.json` to an array of `{ "name", "mint" }` o
 ]
 ```
 
-Meridian deploys only single-sided SOL into token Y, so eligible pools must have SOL as token Y even when the allowlist contains other quote tokens. The screener checks both mint addresses before ranking candidates. Deploy checks them again against fresh pool details and on-chain pool data. Edit the file and restart the bot to change the list; the AI `update_config` tool cannot change it.
+Meridian deploys only single-sided SOL into token Y, so deploy candidates must have SOL as token Y even when the allowlist contains other quote tokens. Startup, terminal `/candidates`, and Telegram `/screen` show every pool returned by the current discovery page that passes the screening settings, marking pools outside the deployment allowlist as `OBSERVE`. Autonomous selection considers only `ALLOWLIST` pools. Manual deploys are blocked for `OBSERVE` pools too; the deploy path checks fresh pool details and on-chain pool data. Edit the file and restart the bot to change the list; the AI `update_config` tool cannot change it.
 
 ### Management
 

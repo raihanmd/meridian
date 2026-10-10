@@ -7,7 +7,8 @@ import { agentLoop } from "./agent.js";
 import { log } from "./logger.js";
 import { getMyPositions, closePosition, getActiveBin } from "./tools/dlmm.js";
 import { getWalletBalances } from "./tools/wallet.js";
-import { getTopCandidates } from "./tools/screening.js";
+import { discoverPools, getTopCandidates } from "./tools/screening.js";
+import { getPoolRestrictionReason } from "./token-allowlist.js";
 import { config, reloadScreeningThresholds, computeDeployAmount } from "./config.js";
 import { evolveThresholds, getPerformanceSummary } from "./lessons.js";
 import { executeTool, registerCronRestarter } from "./tools/executor.js";
@@ -853,23 +854,24 @@ process.on("SIGTERM", () => shutdown("SIGTERM"));
 // ═══════════════════════════════════════════
 //  FORMAT CANDIDATES TABLE
 // ═══════════════════════════════════════════
-function formatCandidates(candidates) {
-  if (!candidates.length) return "  No eligible pools found right now.";
+function candidateRestriction(pool) {
+  return getPoolRestrictionReason(pool.base?.mint, pool.quote?.mint, config.screening.tokenAllowlist);
+}
+
+function formatCandidates(candidates, filteredExamples = []) {
+  if (!candidates.length) {
+    const examples = filteredExamples.slice(0, 3)
+      .map((entry) => `  - ${entry.name}: ${entry.reason}`);
+    return ["  No pools matched the configured screening filters.", ...examples].join("\n");
+  }
 
   const lines = candidates.map((p, i) => {
-    const name = (p.name || "unknown").padEnd(20);
-    const ftvl = `${p.fee_active_tvl_ratio ?? p.fee_tvl_ratio}%`.padStart(8);
-    const vol = `$${((p.volume_window || 0) / 1000).toFixed(1)}k`.padStart(8);
-    const active = `${p.active_pct}%`.padStart(6);
-    const org = String(p.organic_score).padStart(4);
-    return `  [${i + 1}]  ${name}  fee/aTVL:${ftvl}  vol:${vol}  in-range:${active}  organic:${org}`;
+    const status = candidateRestriction(p) ? "OBSERVE" : "ALLOWLIST";
+    const metrics = `fee/aTVL:${p.fee_active_tvl_ratio ?? "?"}  vol:$${p.volume_window ?? "?"}  TVL:$${p.tvl ?? "?"}  organic:${p.organic_score ?? "?"}`;
+    return `  [${i + 1}] ${status} ${p.name || "unknown"} | ${metrics}\n      ${p.pool} | ${p.base?.symbol || "?"}/${p.quote?.symbol || "?"}`;
   });
 
-  return [
-    "  #   pool                  fee/aTVL     vol    in-range  organic",
-    "  " + "─".repeat(68),
-    ...lines,
-  ].join("\n");
+  return lines.join("\n");
 }
 
 function getDeterministicCloseRule(position, managementConfig) {
@@ -943,14 +945,14 @@ function getLatestCandidatesMeta() {
   };
 }
 
-function describeLatestCandidates(limit = 5) {
+function describeLatestCandidates(limit = 50) {
   if (!_latestCandidates.length) return "No cached candidates yet. Run /screen first.";
   const lines = _latestCandidates.slice(0, limit).map((pool, i) => {
     const feeTvl = pool.fee_active_tvl_ratio ?? pool.fee_tvl_ratio ?? "?";
     const vol = pool.volume_window ?? pool.volume_24h ?? "?";
     const active = pool.active_pct ?? "?";
     const organic = pool.organic_score ?? "?";
-    return `${i + 1}. ${pool.name} | fee/aTVL ${feeTvl}% | vol $${vol} | in-range ${active}% | organic ${organic}`;
+    return `${i + 1}. [${candidateRestriction(pool) ? "OBSERVE" : "ALLOWLIST"}] ${pool.name} | ${pool.pool} | fee/aTVL ${feeTvl} | vol $${vol} | in-range ${active}% | organic ${organic}`;
   });
   const age = _latestCandidatesAt ? new Date(_latestCandidatesAt).toLocaleString("en-US", { hour12: false }) : "unknown";
   return `Latest candidates (${_latestCandidates.length}) — updated ${age}\n\n${lines.join("\n")}`;
@@ -1266,24 +1268,37 @@ function formatHelpText() {
   ].join("\n");
 }
 
-async function runDeterministicScreen(limit = 5) {
-  const top = await getTopCandidates({ limit });
-  const candidates = (top?.candidates || top?.pools || []).slice(0, limit);
+async function runDeterministicScreen() {
+  const discovery = await discoverPools({ page_size: 50 });
+  const candidates = discovery.pools;
   setLatestCandidates(candidates);
   if (candidates.length > 0) {
     const lines = candidates.map((pool, i) => {
       const feeTvl = pool.fee_active_tvl_ratio ?? pool.fee_tvl_ratio ?? "?";
       const vol = pool.volume_window ?? pool.volume_24h ?? "?";
-      return `${i + 1}. ${pool.name} | ${pool.pool}\n   fee/aTVL ${feeTvl}% | vol $${vol} | organic ${pool.organic_score ?? "?"}`;
+      const status = candidateRestriction(pool) ? "OBSERVE" : "ALLOWLIST";
+      return `${i + 1}. [${status}] ${pool.name} | ${pool.pool}\n   fee/aTVL ${feeTvl} | vol $${vol} | organic ${pool.organic_score ?? "?"}`;
     });
-    return `Top candidates (${candidates.length})\n\n${lines.join("\n")}`;
+    return `Pools matching config: ${candidates.length} (API total: ${discovery.total ?? "?"}, received: ${discovery.screened})\n\n${lines.join("\n")}`;
   }
-  const examples = (top?.filtered_examples || []).slice(0, 3)
+  const examples = (discovery.filtered_examples || []).slice(0, 3)
     .map((entry) => `- ${entry.name}: ${entry.reason}`)
     .join("\n");
   return examples
-    ? `No candidates available.\nFiltered examples:\n${examples}`
-    : "No candidates available right now.";
+    ? `No pools matched config (API total: ${discovery.total ?? "?"}, received: ${discovery.screened}).\nFiltered examples:\n${examples}`
+    : `No pools matched config (API total: ${discovery.total ?? "?"}, received: ${discovery.screened}).`;
+}
+
+async function sendScreeningText(text) {
+  let chunk = "";
+  for (const line of text.split("\n")) {
+    if (chunk.length + line.length + 1 > 3500 && chunk) {
+      await sendMessage(chunk);
+      chunk = "";
+    }
+    chunk += `${line}\n`;
+  }
+  if (chunk) await sendMessage(chunk);
 }
 
 async function deployLatestCandidate(index) {
@@ -1291,6 +1306,8 @@ async function deployLatestCandidate(index) {
   if (!candidate) {
     throw new Error("Invalid candidate index. Run /screen first.");
   }
+  const restriction = candidateRestriction(candidate);
+  if (restriction) throw new Error(`Pool is observation-only: ${restriction}`);
   if (_latestCandidates.length === 1) {
     const mint = candidate.base?.mint || candidate.base_mint || null;
     const [smartWallets, narrative, tokenInfo] = await Promise.allSettled([
@@ -1334,8 +1351,8 @@ async function deployLatestCandidate(index) {
     organic_score: candidate.organic_score,
     initial_value_usd: candidate.tvl ?? candidate.active_tvl ?? null,
   });
-  if (result?.success === false || result?.error) {
-    throw new Error(result.error || "Deploy failed");
+  if (result?.blocked || result?.success === false || result?.error) {
+    throw new Error(result.reason || result.error || "Deploy failed");
   }
   return { result, candidate, deployAmount, binsBelow };
 }
@@ -1536,7 +1553,7 @@ async function telegramHandler(msg) {
 
   if (text === "/screen") {
     try {
-      await sendMessage(await runDeterministicScreen(5)).catch(() => {});
+      await sendScreeningText(await runDeterministicScreen()).catch(() => {});
     } catch (e) {
       await sendMessage(`Error: ${e.message}`).catch(() => {});
     }
@@ -1544,7 +1561,7 @@ async function telegramHandler(msg) {
   }
 
   if (text === "/candidates") {
-    await sendMessage(describeLatestCandidates(5)).catch(() => {});
+    await sendScreeningText(describeLatestCandidates()).catch(() => {});
     return;
   }
 
@@ -1725,24 +1742,25 @@ if (isMain && isTTY) {
     finally { busy = false; rl.setPrompt(buildPrompt()); rl.resume(); rl.prompt(); }
   }
 
-  // ── Startup: show wallet + top candidates ──
+  // ── Startup: show wallet + screened pools ──
   console.log(`
 ╔═══════════════════════════════════════════╗
 ║         DLMM LP Agent — Ready             ║
 ╚═══════════════════════════════════════════╝
 `);
 
-  console.log("Fetching wallet and top pool candidates...\n");
+  console.log("Fetching wallet and pools matching screening config...\n");
 
   busy = true;
   try {
-    const [wallet, positions, { candidates, total_eligible, total_screened }] = await Promise.all([
+    const [wallet, positions, discovery] = await Promise.all([
       getWalletBalances(),
       getMyPositions({ force: true }),
-      getTopCandidates({ limit: 5 }),
+      discoverPools({ page_size: 50 }),
     ]);
+    const { pools, total, screened, filtered_examples } = discovery;
 
-    setLatestCandidates(candidates);
+    setLatestCandidates(pools);
 
     console.log(`Wallet:    ${wallet.sol} SOL  ($${wallet.sol_usd})  |  SOL price: $${wallet.sol_price}`);
     console.log(`Positions: ${positions.total_positions} open\n`);
@@ -1756,8 +1774,8 @@ if (isMain && isTTY) {
       console.log();
     }
 
-    console.log(`Top pools (${total_eligible} eligible from ${total_screened} screened):\n`);
-    console.log(formatCandidates(candidates));
+    console.log(`Pools matching config: ${pools.length} (API total: ${total ?? "?"}, received: ${screened})\n`);
+    console.log(formatCandidates(pools, filtered_examples));
 
   } catch (e) {
     console.error(`Startup fetch failed: ${e.message}`);
@@ -1773,10 +1791,10 @@ if (isMain && isTTY) {
 
   console.log(`
 Commands:
-  1 / 2 / 3 ...  Deploy ${DEPLOY} SOL into that pool
+  1 / 2 / 3 ...  Deploy ${DEPLOY} SOL into an ALLOWLIST pool
   auto           Let the agent pick and deploy automatically
   /status        Refresh wallet + positions
-  /candidates    Refresh top pool list
+  /candidates    Refresh pools matching screening config
   /briefing      Show morning briefing (last 24h)
   /learn         Study top LPers from the best current pool and save lessons
   /learn <addr>  Study top LPers from a specific pool address
@@ -1797,6 +1815,11 @@ Commands:
     if (!isNaN(pick) && pick >= 1 && pick <= latest.length) {
       await runBusy(async () => {
         const pool = latest[pick - 1];
+        const restriction = candidateRestriction(pool);
+        if (restriction) {
+          console.log(`\nPool is observation-only: ${restriction}\n`);
+          return;
+        }
         console.log(`\nDeploying ${DEPLOY} SOL into ${pool.name}...\n`);
         const { content: reply } = await agentLoop(
           `Deploy ${DEPLOY} SOL into pool ${pool.pool} (${pool.name}). Call get_active_bin first then deploy_position. Report result.`,
@@ -1860,10 +1883,10 @@ Commands:
 
     if (input === "/candidates") {
       await runBusy(async () => {
-        const { candidates, total_eligible, total_screened } = await getTopCandidates({ limit: 5 });
-        setLatestCandidates(candidates);
-        console.log(`\nTop pools (${total_eligible} eligible from ${total_screened} screened):\n`);
-        console.log(formatCandidates(candidates));
+        const { pools, total, screened, filtered_examples } = await discoverPools({ page_size: 50 });
+        setLatestCandidates(pools);
+        console.log(`\nPools matching config: ${pools.length} (API total: ${total ?? "?"}, received: ${screened})\n`);
+        console.log(formatCandidates(pools, filtered_examples));
         console.log();
       });
       return;

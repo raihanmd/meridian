@@ -7,21 +7,14 @@ const toolDefinitions = [
     function: {
       name: "discover_pools",
       description: `Fetch top DLMM pools from the Meteora Pool Discovery API.
-Pools are pre-filtered for safety:
-- No critical warnings on base/quote tokens
-- No high single ownership on base token
-- Base token market cap >= $150k
-- Base token holders >= 100
-- Volume >= $1k (in timeframe)
-- Active TVL >= $10k
-- Fee/Active TVL ratio >= 0.01 (in timeframe)
-- Both tokens organic score >= 60
+Pools are filtered using the current user-config.json screening thresholds and token safety checks.
+tokenAllowlist does not hide pools from this discovery result.
 
-Returns condensed pool data: address, name, tokens, bin_step, fee_pct,
+Returns matching pools for observation as condensed data: address, name, tokens, bin_step, fee_pct,
 active_tvl, fee_window, volume_window, fee_tvl_ratio, volatility from max(timeframe, 30m), organic_score,
 holders, mcap, active_positions, price_change_pct, warning count.
 
-Use this as the primary tool for finding new LP opportunities.`,
+Use get_top_candidates for deployment selection.`,
       parameters: {
         type: "object",
         properties: {
@@ -49,7 +42,7 @@ Use this as the primary tool for finding new LP opportunities.`,
     function: {
       name: "get_top_candidates",
       description: `Get the top pre-scored pool candidates for deployment review.
-All filtering, scoring, and rule-checking is done in code — no analysis needed.
+Deployment restrictions, scoring, and rule-checking are done in code — no analysis needed.
 Returns the top N eligible pools ranked by score (fee/TVL, organic, stability, volume).
 Each pool includes a score (0-100) and has already passed all hard disqualifiers.
 Use this instead of discover_pools for screening cycles.
