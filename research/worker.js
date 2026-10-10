@@ -2,11 +2,9 @@ import "../envcrypt.js";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { config, reloadScreeningThresholds } from "../config.js";
-import { discoverPools } from "../tools/screening.js";
+import { config } from "../config.js";
 import { sendMessage } from "../telegram.js";
-import { SOL_MINT } from "../token-allowlist.js";
-import { DEFAULT_RESEARCH_DIR, enqueuePool, listJobs, readJudgment, readReport, saveJob, saveJudgment, saveReport } from "./queue.js";
+import { DEFAULT_RESEARCH_DIR, listJobs, readJudgment, readReport, saveJob, saveJudgment, saveReport } from "./queue.js";
 import { runHermesResearch } from "./hermes.js";
 import { formatJudgment, judgeSkillAvailable, runHermesJudgment } from "./judge.js";
 import { formatReport, splitTelegram } from "./report.js";
@@ -17,20 +15,28 @@ const MAX_RESEARCH_ATTEMPTS = 5;
 const MAX_JUDGE_ATTEMPTS = 3;
 const RETRY_BASE_MS = 60_000;
 let stopping = false;
+let activeController = null;
+let backgroundWorker = null;
 
 function retryDelay(attempts) {
   return Math.min(3_600_000, RETRY_BASE_MS * 2 ** Math.min(attempts - 1, 6));
 }
 
-export async function scanResearchPools(root = ROOT, discover = discoverPools) {
-  reloadScreeningThresholds();
-  const result = await discover({ page_size: 50 });
-  let added = 0;
-  for (const pool of result.pools) {
-    if (pool.base?.mint === SOL_MINT) continue;
-    if (await enqueuePool(root, pool)) added++;
-  }
-  return { added, seen: result.pools.length, total: result.total };
+export function formatResearchHeartbeat(jobs) {
+  const researchPending = jobs.filter((job) => ["pending", "running", "ready"].includes(job.status)).length;
+  const researchFailed = jobs.filter((job) => job.status === "failed").length;
+  const judgmentPending = jobs.filter((job) => job.status === "sent" && !["sent", "failed"].includes(job.judgment?.status)).length;
+  return [
+    "🧪 Meridian research worker aktif",
+    `Riset menunggu/berjalan: ${researchPending} | gagal: ${researchFailed}`,
+    `Kajian Syariah menunggu/berjalan: ${judgmentPending}`,
+    "Mint baru masuk antrean saat bot utama menemukan pool yang lolos filter.",
+  ].join("\n");
+}
+
+export async function announceResearchHeartbeat(jobs, send = sendMessage) {
+  const response = await send(formatResearchHeartbeat(jobs), { timeoutMs: 15_000 });
+  if (!response?.ok) throw new Error("Telegram did not confirm research heartbeat delivery");
 }
 
 export async function processResearchJobs(root = ROOT, { research = runHermesResearch, send = sendMessage, now = Date.now, maxJobs = Infinity, signal } = {}) {
@@ -50,6 +56,7 @@ export async function processResearchJobs(root = ROOT, { research = runHermesRes
         job.nextDeliveryAt = current;
         job.error = null;
         await saveJob(root, job);
+        console.log(`[RESEARCH] Report ready for ${job.mint}`);
       } catch (error) {
         if (signal?.aborted) break;
         job.attempts = (job.attempts || 0) + 1;
@@ -57,6 +64,7 @@ export async function processResearchJobs(root = ROOT, { research = runHermesRes
         job.nextAttemptAt = current + retryDelay(job.attempts);
         job.error = String(error.message || error).slice(0, 500);
         await saveJob(root, job);
+        console.warn(`[RESEARCH] ${job.mint} attempt ${job.attempts}/${MAX_RESEARCH_ATTEMPTS}: ${job.error}`);
         continue;
       }
     }
@@ -75,11 +83,13 @@ export async function processResearchJobs(root = ROOT, { research = runHermesRes
       job.sentAt = new Date(now()).toISOString();
       job.error = null;
       await saveJob(root, job);
+      console.log(`[RESEARCH] Report sent for ${job.mint}`);
     } catch (error) {
       job.deliveryAttempts = (job.deliveryAttempts || 0) + 1;
       job.nextDeliveryAt = now() + retryDelay(job.deliveryAttempts);
       job.error = String(error.message || error).slice(0, 500);
       await saveJob(root, job);
+      console.warn(`[RESEARCH] Report delivery retry for ${job.mint}: ${job.error}`);
     }
   }
 }
@@ -105,6 +115,7 @@ export async function processJudgmentJobs(root = ROOT, { judge = runHermesJudgme
         state.nextDeliveryAt = current;
         state.error = null;
         await saveJob(root, job);
+        console.log(`[RESEARCH] Judgment ready for ${job.mint}: ${judgment.status}`);
       } catch (error) {
         if (signal?.aborted) break;
         state.attempts++;
@@ -112,6 +123,7 @@ export async function processJudgmentJobs(root = ROOT, { judge = runHermesJudgme
         state.nextAttemptAt = current + retryDelay(state.attempts);
         state.error = String(error.message || error).slice(0, 500);
         await saveJob(root, job);
+        console.warn(`[RESEARCH] Judgment ${job.mint} attempt ${state.attempts}/${MAX_JUDGE_ATTEMPTS}: ${state.error}`);
         continue;
       }
     }
@@ -131,11 +143,13 @@ export async function processJudgmentJobs(root = ROOT, { judge = runHermesJudgme
       state.sentAt = new Date(now()).toISOString();
       state.error = null;
       await saveJob(root, job);
+      console.log(`[RESEARCH] Judgment sent for ${job.mint}`);
     } catch (error) {
       state.deliveryAttempts++;
       state.nextDeliveryAt = now() + retryDelay(state.deliveryAttempts);
       state.error = String(error.message || error).slice(0, 500);
       await saveJob(root, job);
+      console.warn(`[RESEARCH] Judgment delivery retry for ${job.mint}: ${state.error}`);
     }
   }
   return processed;
@@ -160,23 +174,28 @@ async function acquireLock(root) {
 }
 
 export async function main() {
+  stopping = false;
   const unlock = await acquireLock(ROOT);
   const controller = new AbortController();
+  activeController = controller;
   const stop = () => { stopping = true; controller.abort(); };
   process.on("SIGINT", stop);
   process.on("SIGTERM", stop);
   try {
-    let nextScanAt = 0;
+    let nextHeartbeatAt = 0;
     let warnedMissingJudge = false;
     while (!stopping) {
-      if (Date.now() >= nextScanAt) {
+      if (Date.now() >= nextHeartbeatAt) {
         try {
-          const scan = await scanResearchPools(ROOT);
-          console.log(`[RESEARCH] Discovery: ${scan.added} new token(s), ${scan.seen} filtered pool(s) on current page`);
+          const jobs = await listJobs(ROOT);
+          console.log(`[RESEARCH] Worker alive; ${jobs.length} token job(s) on disk`);
+          announceResearchHeartbeat(jobs)
+            .then(() => console.log("[RESEARCH] Worker heartbeat sent to Telegram"))
+            .catch((error) => console.warn(`[RESEARCH] Worker heartbeat notification failed: ${error.message}`));
         } catch (error) {
-          console.error(`[RESEARCH] Discovery failed: ${error.message}`);
+          console.error(`[RESEARCH] Queue heartbeat failed: ${error.message}`);
         }
-        nextScanAt = Date.now() + INTERVAL_MS;
+        nextHeartbeatAt = Date.now() + INTERVAL_MS;
       }
       try { await processResearchJobs(ROOT, { maxJobs: 1, signal: controller.signal }); }
       catch (error) { console.error(`[RESEARCH] Queue failed: ${error.message}`); }
@@ -190,22 +209,52 @@ export async function main() {
         }
       } catch (error) { console.error(`[RESEARCH] Judgment queue failed: ${error.message}`); }
       if (!stopping) await new Promise((resolve) => {
-        const stop = () => { clearTimeout(timer); finish(); };
         const finish = () => {
-          process.off("SIGINT", stop);
-          process.off("SIGTERM", stop);
+          clearTimeout(timer);
+          controller.signal.removeEventListener("abort", finish);
           resolve();
         };
         const timer = setTimeout(finish, 15_000);
-        process.once("SIGINT", stop);
-        process.once("SIGTERM", stop);
+        controller.signal.addEventListener("abort", finish, { once: true });
       });
     }
   } finally {
+    activeController = null;
     process.off("SIGINT", stop);
     process.off("SIGTERM", stop);
     await unlock();
   }
+}
+
+export function startBackgroundResearchWorker() {
+  if (backgroundWorker) return backgroundWorker;
+  let cancelled = false;
+  let wakeRetry = null;
+  const done = (async () => {
+    while (!cancelled) {
+      try { await main(); }
+      catch (error) { console.error(`[RESEARCH] Worker stopped unexpectedly: ${error.message}`); }
+      if (cancelled) break;
+      await new Promise((resolve) => {
+        const timer = setTimeout(resolve, 60_000);
+        wakeRetry = () => { clearTimeout(timer); resolve(); };
+      });
+      wakeRetry = null;
+    }
+  })();
+  const handle = {
+    done,
+    async stop() {
+      cancelled = true;
+      stopping = true;
+      activeController?.abort();
+      wakeRetry?.();
+      await done;
+    },
+  };
+  backgroundWorker = handle;
+  done.finally(() => { if (backgroundWorker === handle) backgroundWorker = null; });
+  return handle;
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

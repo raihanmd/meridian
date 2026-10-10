@@ -23,23 +23,5 @@ module.exports = {
         NODE_ENV: "production",
       },
     },
-    {
-      name: "meridian-research",
-      script: path.join(repoRoot, "research", "worker.js"),
-      cwd: repoRoot,
-      interpreter: "node",
-      instances: 1,
-      exec_mode: "fork",
-      autorestart: true,
-      restart_delay: 5000,
-      kill_timeout: 10000,
-      max_restarts: 10,
-      min_uptime: "10s",
-      merge_logs: true,
-      time: true,
-      env: {
-        NODE_ENV: "production",
-      },
-    },
   ],
 };

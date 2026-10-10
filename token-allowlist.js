@@ -33,3 +33,16 @@ export function getPoolRestrictionReason(baseMint, quoteMint, allowlist) {
   }
   return null;
 }
+
+export function getPoolAllowlistDisplay(baseMint, quoteMint, allowlist) {
+  const baseAllowlisted = Array.isArray(allowlist) && allowlist.some((entry) => entry.mint === baseMint);
+  const restriction = getPoolRestrictionReason(baseMint, quoteMint, allowlist);
+  return {
+    baseAllowlisted,
+    deployable: restriction === null,
+    restriction,
+    label: restriction === null ? "✅ ALLOWLIST · DEPLOY READY"
+      : baseAllowlisted ? "✅ TOKEN ALLOWLIST · 👀 OBSERVE"
+      : "👀 OBSERVE",
+  };
+}

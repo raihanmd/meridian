@@ -543,9 +543,9 @@ export async function discoverPools({
  * Returns eligible pools for the agent to evaluate and pick from.
  * Hard filters applied in code, agent decides which to deploy into.
  */
-export async function getTopCandidates({ limit = 10 } = {}) {
+export async function getTopCandidates({ limit = 10, discovery: providedDiscovery } = {}) {
   const { config } = await import("../config.js");
-  const discovery = await discoverPools({ page_size: 50 });
+  const discovery = providedDiscovery ?? await discoverPools({ page_size: 50 });
   const { pools } = discovery;
   const filteredOut = Array.isArray(discovery.filtered_examples) ? [...discovery.filtered_examples] : [];
 

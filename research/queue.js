@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { PublicKey } from "@solana/web3.js";
 import { repoPath } from "../repo-root.js";
+import { SOL_MINT } from "../token-allowlist.js";
 
 export const DEFAULT_RESEARCH_DIR = repoPath("data", "token-research");
 
@@ -46,7 +47,7 @@ export async function enqueuePool(root, pool, now = Date.now()) {
     if (error.code !== "ENOENT" && !(error instanceof SyntaxError)) throw error;
     if (error instanceof SyntaxError) await fs.rename(file, path.join(dir, `job.corrupt.${Date.now()}.json`));
   }
-  await saveJob(root, {
+  const job = {
     mint,
     symbol: String(pool.base.symbol || "").replace(/\s+/g, " ").trim().slice(0, 40),
     pool: String(pool.pool || ""),
@@ -57,8 +58,25 @@ export async function enqueuePool(root, pool, now = Date.now()) {
     nextAttemptAt: now,
     deliveryAttempts: 0,
     nextDeliveryAt: now,
-  });
-  return true;
+  };
+  const temp = path.join(dir, `job.new.${process.pid}.${now}.${Math.random().toString(36).slice(2)}.tmp`);
+  try {
+    await fs.writeFile(temp, JSON.stringify(job, null, 2), { flag: "wx", mode: 0o600 });
+    try { await fs.link(temp, file); }
+    catch (error) { if (error.code === "EEXIST") return false; throw error; }
+    return true;
+  } finally {
+    await fs.rm(temp, { force: true });
+  }
+}
+
+export async function enqueueResearchCandidates(root, pools, now = Date.now()) {
+  let added = 0;
+  for (const pool of pools || []) {
+    if (pool.base?.mint === SOL_MINT) continue;
+    if (await enqueuePool(root, pool, now)) added++;
+  }
+  return { added, seen: Array.isArray(pools) ? pools.length : 0 };
 }
 
 export async function listJobs(root) {

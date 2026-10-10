@@ -5,11 +5,11 @@ import path from "node:path";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import test from "node:test";
-import { enqueuePool, listJobs, readReport } from "../research/queue.js";
+import { enqueuePool, enqueueResearchCandidates, listJobs, readReport } from "../research/queue.js";
 import { runHermesResearch } from "../research/hermes.js";
 import { parseReport, splitTelegram } from "../research/report.js";
 import { retryFailedResearch } from "../research/retry.js";
-import { processResearchJobs, scanResearchPools } from "../research/worker.js";
+import { announceResearchHeartbeat, formatResearchHeartbeat, processResearchJobs } from "../research/worker.js";
 import { SOL_MINT } from "../token-allowlist.js";
 
 const MINT = "7KEPApdbBMByrmqihz3bht2uMhFQcatjfSFQCKq66kH3";
@@ -31,6 +31,14 @@ test("research queue deduplicates mints across pools and survives restart", asyn
   assert.equal(await enqueuePool(root, pool("../bad")), false);
 });
 
+test("concurrent discovery writes cannot replace an existing research job", async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "meridian-research-"));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const results = await Promise.all([enqueuePool(root, pool(MINT)), enqueuePool(root, pool(MINT))]);
+  assert.equal(results.filter(Boolean).length, 1);
+  assert.equal((await listJobs(root)).length, 1);
+});
+
 test("corrupt queue state is preserved and recreated on the next discovery", async (t) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "meridian-research-"));
   t.after(() => fs.rm(root, { recursive: true, force: true }));
@@ -42,12 +50,19 @@ test("corrupt queue state is preserved and recreated on the next discovery", asy
   assert.ok((await fs.readdir(path.join(root, MINT))).some((name) => name.startsWith("job.corrupt.")));
 });
 
-test("scanner queues screened tokens even when allowlist is empty", async (t) => {
+test("main discovery queues screened tokens even when allowlist is empty", async (t) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "meridian-research-"));
   t.after(() => fs.rm(root, { recursive: true, force: true }));
-  const result = await scanResearchPools(root, async () => ({ pools: [pool(MINT), pool(OTHER), pool(SOL_MINT)], total: 3 }));
+  const result = await enqueueResearchCandidates(root, [pool(MINT), pool(OTHER), pool(SOL_MINT)]);
   assert.equal(result.added, 2);
   assert.equal((await listJobs(root)).length, 2);
+});
+
+test("research worker heartbeat reports queue health without fetching pools", async () => {
+  const message = formatResearchHeartbeat([{ status: "pending" }, { status: "failed" }, { status: "sent", judgment: { status: "pending" } }]);
+  assert.match(message, /Riset menunggu\/berjalan: 1 \| gagal: 1/);
+  assert.match(message, /Kajian Syariah menunggu\/berjalan: 1/);
+  await announceResearchHeartbeat([], async (text) => { assert.match(text, /worker aktif/); return { ok: true }; });
 });
 
 test("report rejects wrong mint and preserves source URLs", () => {

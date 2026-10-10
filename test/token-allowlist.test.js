@@ -3,7 +3,7 @@ import test from "node:test";
 import { config } from "../config.js";
 import { discoverPools } from "../tools/screening.js";
 import { executeTool } from "../tools/executor.js";
-import { getPoolRestrictionReason, normalizeTokenAllowlist, SOL_MINT } from "../token-allowlist.js";
+import { getPoolAllowlistDisplay, getPoolRestrictionReason, normalizeTokenAllowlist, SOL_MINT } from "../token-allowlist.js";
 
 const GHOST_MINT = "BBKPiLM9KjdJW7oQSKt99RVWcZdhF6sEHRKnwqeBGHST";
 const USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
@@ -19,6 +19,21 @@ test("allowlist requires canonical mint objects and both sides of a SOL pair", (
   assert.match(getPoolRestrictionReason(GHOST_MINT, SOL_MINT, []), /tokenAllowlist is empty/);
   assert.throws(() => normalizeTokenAllowlist([{ name: "bad", mint: "bad mint" }]), /invalid mint/);
   assert.throws(() => normalizeTokenAllowlist("GHOST"), /must be an array/);
+});
+
+test("candidate labels distinguish an approved token from a deployable pair", () => {
+  const allowlist = normalizeTokenAllowlist([{ name: "GHOST", mint: GHOST_MINT }, { name: "SOL", mint: SOL_MINT }]);
+  const ready = getPoolAllowlistDisplay(GHOST_MINT, SOL_MINT, allowlist);
+  assert.equal(ready.deployable, true);
+  assert.match(ready.label, /✅ ALLOWLIST/);
+  const observed = getPoolAllowlistDisplay(GHOST_MINT, USDC_MINT, allowlist);
+  assert.equal(observed.baseAllowlisted, true);
+  assert.equal(observed.deployable, false);
+  assert.match(observed.label, /✅ TOKEN ALLOWLIST.*OBSERVE/);
+  assert.match(observed.restriction, /token Y must be SOL/);
+  const unlisted = getPoolAllowlistDisplay(USDC_MINT, SOL_MINT, allowlist);
+  assert.equal(unlisted.baseAllowlisted, false);
+  assert.doesNotMatch(unlisted.label, /✅/);
 });
 
 test("discovery keeps pools outside the allowlist for manual screening", async () => {

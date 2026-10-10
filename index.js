@@ -8,7 +8,9 @@ import { log } from "./logger.js";
 import { getMyPositions, closePosition, getActiveBin } from "./tools/dlmm.js";
 import { getWalletBalances } from "./tools/wallet.js";
 import { discoverPools, getTopCandidates } from "./tools/screening.js";
-import { getPoolRestrictionReason } from "./token-allowlist.js";
+import { getPoolAllowlistDisplay, getPoolRestrictionReason } from "./token-allowlist.js";
+import { DEFAULT_RESEARCH_DIR, enqueueResearchCandidates } from "./research/queue.js";
+import { startBackgroundResearchWorker } from "./research/worker.js";
 import { config, reloadScreeningThresholds, computeDeployAmount } from "./config.js";
 import { evolveThresholds, getPerformanceSummary } from "./lessons.js";
 import { executeTool, registerCronRestarter } from "./tools/executor.js";
@@ -58,6 +60,14 @@ if (isMain) {
 
 const TP_PCT = config.management.takeProfitPct;
 const DEPLOY = config.management.deployAmountSol;
+const RESEARCH_ROOT = process.env.RESEARCH_DIR || DEFAULT_RESEARCH_DIR;
+let researchWorker = null;
+
+function launchResearchWorker() {
+  if (researchWorker) return;
+  researchWorker = startBackgroundResearchWorker();
+  log("research", "Background research cycle started; consuming observer queue");
+}
 
 // ═══════════════════════════════════════════
 //  CYCLE TIMERS
@@ -200,6 +210,7 @@ async function maybeRunMissedBriefing() {
 function stopCronJobs() {
   for (const task of _cronTasks) task.stop();
   if (_cronTasks._pnlPollInterval) clearInterval(_cronTasks._pnlPollInterval);
+  if (_cronTasks._screenInterval) clearInterval(_cronTasks._screenInterval);
   _cronTasks = [];
 }
 
@@ -383,6 +394,29 @@ After executing, write a brief one-line result per position.
   return mgmtReport;
 }
 
+async function recordResearchCandidates(discovery, source) {
+  const result = await enqueueResearchCandidates(RESEARCH_ROOT, discovery.pools);
+  log("observer", `${source}: ${result.seen} filtered pool(s), ${result.added} new token(s) queued for research`);
+  if (source === "screening cycle" && telegramEnabled()) {
+    const message = `🔬 Observer scan selesai\nPool lolos filter: ${result.seen} (API total: ${discovery.total ?? "?"}; halaman pertama maksimal 50)\nToken baru masuk antrean riset: ${result.added}\nEksekusi tetap dibatasi tokenAllowlist.`;
+    sendMessage(message, { timeoutMs: 15_000 })
+      .then((response) => {
+        if (!response?.ok) log("observer_warn", "Observer scan Telegram notification was not confirmed");
+      })
+      .catch((error) => log("observer_warn", `Observer scan Telegram notification failed: ${error.message}`));
+  }
+  return result;
+}
+
+function notifyScreeningSkip(report, silent) {
+  if (silent || !telegramEnabled()) return;
+  sendMessage(`🔍 Screening Cycle\n\n${report}`, { timeoutMs: 15_000 })
+    .then((response) => {
+      if (!response?.ok) log("telegram_warn", "Screening skip notification was not confirmed");
+    })
+    .catch((error) => log("telegram_warn", `Screening skip notification failed: ${error.message}`));
+}
+
 export async function runScreeningCycle({ silent = false } = {}) {
   if (_screeningBusy) {
     log("cron", "Screening skipped — previous cycle still running");
@@ -390,6 +424,20 @@ export async function runScreeningCycle({ silent = false } = {}) {
   }
   _screeningBusy = true; // set immediately — prevents TOCTOU race with concurrent callers
   _screeningLastTriggered = Date.now();
+  timers.screeningLastRun = Date.now();
+  log("cron", "Screening cycle triggered");
+
+  let observerDiscovery = null;
+  try {
+    observerDiscovery = await discoverPools({ page_size: 50 });
+    await recordResearchCandidates(observerDiscovery, "screening cycle");
+  } catch (error) {
+    log("observer_warn", `Candidate queue update failed: ${error.message}`);
+    const report = `Screening observer failed: ${error.message}`;
+    notifyScreeningSkip(report, silent);
+    _screeningBusy = false;
+    return report;
+  }
 
   // Hard guards — don't even run the agent if preconditions aren't met
   let prePositions, preBalance;
@@ -406,6 +454,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
         summary: "Screening skipped",
         reason: `Max positions reached (${prePositions.total_positions}/${config.risk.maxPositions})`,
       });
+      notifyScreeningSkip(screenReport, silent);
       _screeningBusy = false;
       return screenReport;
     }
@@ -420,19 +469,20 @@ export async function runScreeningCycle({ silent = false } = {}) {
         summary: "Screening skipped",
         reason: `Insufficient SOL (${preBalance.sol.toFixed(3)} < ${minRequired})`,
       });
+      notifyScreeningSkip(screenReport, silent);
       _screeningBusy = false;
       return screenReport;
     }
   } catch (e) {
     log("cron_error", `Screening pre-check failed: ${e.message}`);
     screenReport = `Screening pre-check failed: ${e.message}`;
+    notifyScreeningSkip(screenReport, silent);
     _screeningBusy = false;
     return screenReport;
   }
   if (!silent && telegramEnabled()) {
     liveMessage = await createLiveMessage("🔍 Screening Cycle", "Scanning candidates...");
   }
-  timers.screeningLastRun = Date.now();
   log("cron", `Starting screening cycle [model: ${config.llm.screeningModel}]`);
   try {
     // Reuse pre-fetched balance — no extra RPC call needed
@@ -447,8 +497,9 @@ export async function runScreeningCycle({ silent = false } = {}) {
       + (activeStrategy ? `\nSTRATEGY CONTEXT: ${activeStrategy.name} — entry: ${activeStrategy.entry?.condition || "n/a"} | exit: ${activeStrategy.exit?.notes || "n/a"} | best for: ${activeStrategy.best_for}` : "");
 
     // Fetch top candidates, then recon each sequentially with a small delay to avoid 429s
-    const topCandidates = await getTopCandidates({ limit: 10 }).catch(() => null);
+    const topCandidates = await getTopCandidates({ limit: 10, discovery: observerDiscovery }).catch(() => null);
     const candidates = (topCandidates?.candidates || topCandidates?.pools || []).slice(0, 10);
+    log("cron", `Deploy-eligible candidates after allowlist and position guards: ${candidates.length}`);
     const earlyFilteredExamples = topCandidates?.filtered_examples || [];
 
     const allCandidates = [];
@@ -694,6 +745,7 @@ IMPORTANT:
     screenReport = `Screening cycle failed: ${error.message}`;
   } finally {
     _screeningBusy = false;
+    log("cron", `Screening cycle finished: ${screenReport?.split("\n")[0] || "no report"}`);
     if (!silent && telegramEnabled()) {
       if (screenReport) {
         if (liveMessage) await liveMessage.finalize(stripThink(screenReport)).catch(() => {});
@@ -713,7 +765,9 @@ export function startCronJobs() {
     await runManagementCycle();
   });
 
-  const screenTask = cron.schedule(`*/${Math.max(1, config.schedule.screeningIntervalMin)} * * * *`, runScreeningCycle);
+  const screenInterval = setInterval(() => {
+    runScreeningCycle().catch((error) => log("cron_error", `Screening timer failed: ${error.message}`));
+  }, Math.max(1, Number(config.schedule.screeningIntervalMin) || 40) * 60_000);
 
   const healthTask = cron.schedule(`0 * * * *`, async () => {
     if (_managementBusy) return;
@@ -799,9 +853,10 @@ Summarize the current portfolio health, total fees earned, and performance of al
     }
   }, pnlPollMs);
 
-  _cronTasks = [mgmtTask, screenTask, healthTask, briefingTask, briefingWatchdog];
+  _cronTasks = [mgmtTask, healthTask, briefingTask, briefingWatchdog];
   // Store interval ref so stopCronJobs can clear it
   _cronTasks._pnlPollInterval = pnlPollInterval;
+  _cronTasks._screenInterval = screenInterval;
   log("cron", `Cycles started — management every ${config.schedule.managementIntervalMin}m, screening every ${config.schedule.screeningIntervalMin}m`);
 }
 
@@ -832,14 +887,17 @@ async function shutdown(signal) {
   log("shutdown", `Received ${signal}. Shutting down...`);
   stopPolling();
   stopCronJobs();
+  const researchStop = researchWorker?.stop().catch((error) => {
+    log("shutdown", `Research worker stop failed: ${error.message}`);
+  });
 
-  const positions = await withTimeout(
+  const [positions] = await Promise.all([withTimeout(
     getMyPositions({ force: true, silent: true }).catch((error) => {
       log("shutdown", `Position snapshot failed during shutdown: ${error.message}`);
       return null;
     }),
     5000
-  );
+  ), withTimeout(researchStop, 5000)]);
   if (positions) {
     log("shutdown", `Open positions at shutdown: ${positions.total_positions}`);
   } else {
@@ -866,7 +924,7 @@ function formatCandidates(candidates, filteredExamples = []) {
   }
 
   const lines = candidates.map((p, i) => {
-    const status = candidateRestriction(p) ? "OBSERVE" : "ALLOWLIST";
+    const status = getPoolAllowlistDisplay(p.base?.mint, p.quote?.mint, config.screening.tokenAllowlist).label;
     const metrics = `fee/aTVL:${p.fee_active_tvl_ratio ?? "?"}  vol:$${p.volume_window ?? "?"}  TVL:$${p.tvl ?? "?"}  organic:${p.organic_score ?? "?"}`;
     return `  [${i + 1}] ${status} ${p.name || "unknown"} | ${metrics}\n      ${p.pool} | ${p.base?.symbol || "?"}/${p.quote?.symbol || "?"}`;
   });
@@ -1258,13 +1316,17 @@ function formatHelpText() {
 function formatTelegramCandidates(discovery) {
   const candidates = discovery.pools;
   if (candidates.length > 0) {
+    const statuses = candidates.map((pool) => getPoolAllowlistDisplay(pool.base?.mint, pool.quote?.mint, config.screening.tokenAllowlist));
+    const listed = statuses.filter((status) => status.baseAllowlisted).length;
+    const deployable = statuses.filter((status) => status.deployable).length;
     const lines = candidates.map((pool, i) => {
       const feeTvl = pool.fee_active_tvl_ratio ?? pool.fee_tvl_ratio ?? "?";
       const vol = pool.volume_window ?? pool.volume_24h ?? "?";
-      const status = candidateRestriction(pool) ? "OBSERVE" : "✅ ALLOWLIST";
-      return `${i + 1}. [${status}] ${pool.name} | ${pool.pool}\n   fee/aTVL ${feeTvl} | vol $${vol} | organic ${pool.organic_score ?? "?"}`;
+      const status = statuses[i];
+      const reason = status.baseAllowlisted && status.restriction ? `\n   Deploy blocked: ${status.restriction}` : "";
+      return `${i + 1}. ${status.label} ${pool.name} | ${pool.pool}\n   fee/aTVL ${feeTvl} | vol $${vol} | organic ${pool.organic_score ?? "?"}${reason}`;
     });
-    return `Pools matching config: ${candidates.length} (API total: ${discovery.total ?? "?"}, received: ${discovery.screened})\n\n${lines.join("\n")}`;
+    return `Pools matching config: ${candidates.length} (API total: ${discovery.total ?? "?"}, received: ${discovery.screened})\nToken allowlist matched: ${listed} | Deploy ready: ${deployable}\n${listed === 0 ? "No allowlisted base token on this discovery page.\n" : ""}\n${lines.join("\n")}`;
   }
   const examples = (discovery.filtered_examples || []).slice(0, 3)
     .map((entry) => `- ${entry.name}: ${entry.reason}`)
@@ -1277,6 +1339,7 @@ function formatTelegramCandidates(discovery) {
 async function runDeterministicScreen() {
   const discovery = await discoverPools({ page_size: 50 });
   setLatestCandidates(discovery.pools);
+  await recordResearchCandidates(discovery, "Telegram candidates").catch((error) => log("observer_warn", `Candidate queue update failed: ${error.message}`));
   return formatTelegramCandidates(discovery);
 }
 
@@ -1752,6 +1815,7 @@ if (isMain && isTTY) {
     const { pools, total, screened, filtered_examples } = discovery;
 
     setLatestCandidates(pools);
+    await recordResearchCandidates(discovery, "startup").catch((error) => log("observer_warn", `Candidate queue update failed: ${error.message}`));
 
     console.log(`Wallet:    ${wallet.sol} SOL  ($${wallet.sol_usd})  |  SOL price: $${wallet.sol_price}`);
     console.log(`Positions: ${positions.total_positions} open\n`);
@@ -1780,6 +1844,7 @@ if (isMain && isTTY) {
   maybeRunMissedBriefing().catch(() => { });
 
   startPolling(telegramHandler);
+  launchResearchWorker();
   if (startupCandidatesText) {
     sendScreeningText(startupCandidatesText)
       .then(() => log("telegram", "Startup candidate list sent"))
@@ -1883,6 +1948,7 @@ Commands:
         const discovery = await discoverPools({ page_size: 50 });
         const { pools, total, screened, filtered_examples } = discovery;
         setLatestCandidates(pools);
+        await recordResearchCandidates(discovery, "CLI candidates").catch((error) => log("observer_warn", `Candidate queue update failed: ${error.message}`));
         console.log(`\nPools matching config: ${pools.length} (API total: ${total ?? "?"}, received: ${screened})\n`);
         console.log(formatCandidates(pools, filtered_examples));
         console.log();
@@ -2007,6 +2073,7 @@ Focus on: hold duration, entry/exit timing, what win rates look like, whether sc
   startCronJobs();
   maybeRunMissedBriefing().catch(() => { });
   startPolling(telegramHandler);
+  launchResearchWorker();
   (async () => {
     try {
       await runScreeningCycle({ silent: false });
