@@ -1742,6 +1742,7 @@ if (isMain && isTTY) {
   console.log("Fetching wallet and pools matching screening config...\n");
 
   busy = true;
+  let startupCandidatesText = null;
   try {
     const [wallet, positions, discovery] = await Promise.all([
       getWalletBalances(),
@@ -1766,6 +1767,7 @@ if (isMain && isTTY) {
 
     console.log(`Pools matching config: ${pools.length} (API total: ${total ?? "?"}, received: ${screened})\n`);
     console.log(formatCandidates(pools, filtered_examples));
+    startupCandidatesText = formatTelegramCandidates(discovery);
 
   } catch (e) {
     console.error(`Startup fetch failed: ${e.message}`);
@@ -1778,6 +1780,11 @@ if (isMain && isTTY) {
   maybeRunMissedBriefing().catch(() => { });
 
   startPolling(telegramHandler);
+  if (startupCandidatesText) {
+    sendScreeningText(startupCandidatesText)
+      .then(() => log("telegram", "Startup candidate list sent"))
+      .catch((error) => log("telegram_warn", `Startup candidate list not sent: ${error.message}`));
+  }
 
   console.log(`
 Commands:
