@@ -26,7 +26,7 @@ import fs from "fs";
 import { execSync, spawn } from "child_process";
 import { REPO_ROOT, repoPath } from "../repo-root.js";
 import { normalizeTimeframe, scaleScreeningToTimeframe } from "../screening-scales.js";
-import { getPoolRestrictionReason } from "../token-allowlist.js";
+import { getDualPoolRestrictionReason, getPoolRestrictionReason } from "../token-allowlist.js";
 
 const USER_CONFIG_PATH = repoPath("user-config.json");
 const POOL_DISCOVERY_BASE = "https://pool-discovery-api.datapi.meteora.ag";
@@ -95,7 +95,9 @@ async function validateDeployPoolThresholds(args) {
 
   const baseMint = detail?.token_x?.address || detail?.base_token_address || null;
   const quoteMint = detail?.token_y?.address || detail?.quote_token_address || null;
-  const poolRestriction = getPoolRestrictionReason(baseMint, quoteMint, config.screening.tokenAllowlist);
+  const poolRestriction = config.strategy.dualToken.enabled
+    ? getDualPoolRestrictionReason(baseMint, quoteMint, config.screening.tokenAllowlist, config.strategy.dualToken.baseMints)
+    : getPoolRestrictionReason(baseMint, quoteMint, config.screening.tokenAllowlist);
   if (poolRestriction) return { pass: false, reason: `Pool blocked: ${poolRestriction}.` };
 
   const tvl = poolDetailTvl(detail);
@@ -177,7 +179,7 @@ async function validateDeployPoolThresholds(args) {
     entry_holders: numberOrNull(detail?.base_token_holders ?? detail?.token_x?.holders),
   };
 
-  return { pass: true, entryMarketData };
+  return { pass: true, entryMarketData, poolMints: { x: baseMint, y: quoteMint } };
 }
 
 // Registered by index.js so update_config can restart cron jobs when intervals change
@@ -632,16 +634,37 @@ export async function executeTool(name, args) {
       if (name === "swap_token" && result.tx) {
         notifySwap({ inputSymbol: args.input_mint?.slice(0, 8), outputSymbol: args.output_mint === "So11111111111111111111111111111111111111112" || args.output_mint === "SOL" ? "SOL" : args.output_mint?.slice(0, 8), amountIn: result.amount_in, amountOut: result.amount_out, tx: result.tx }).catch(() => {});
       } else if (name === "deploy_position" && !result?.dry_run) {
-        notifyDeploy({ pair: result.pool_name || args.pool_name || args.pool_address?.slice(0, 8), amountSol: args.amount_y ?? args.amount_sol ?? 0, position: result.position, tx: result.txs?.[0] ?? result.tx, priceRange: result.price_range, rangeCoverage: result.range_coverage, binStep: result.bin_step, baseFee: result.base_fee }).catch(() => {});
+        notifyDeploy({
+          pair: result.pool_name || args.pool_name || args.pool_address?.slice(0, 8),
+          amountSol: result.amount_sol ?? args.amount_y ?? args.amount_sol ?? 0,
+          position: result.position,
+          tx: result.txs?.[0] ?? result.tx,
+          txs: result.txs,
+          priceRange: result.price_range,
+          rangeCoverage: result.range_coverage,
+          binStep: result.bin_step,
+          baseFee: result.base_fee,
+          dualToken: result.dual_token,
+          tokenXMInt: result.token_x_mint,
+          tokenYMInt: result.token_y_mint,
+          amountX: result.amount_x,
+          amountY: result.amount_y,
+          strategy: result.strategy,
+          transactionFeesSol: result.transaction_fees_sol,
+          rentEstimateSol: result.rent_estimate_sol,
+          reserveSol: result.reserve_sol,
+          ta: result.ta,
+        }).catch(() => {});
       } else if (name === "close_position") {
-        notifyClose({ pair: result.pool_name || args.position_address?.slice(0, 8), pnlUsd: result.pnl_usd ?? 0, pnlPct: result.pnl_pct ?? 0 }).catch(() => {});
         // Note low-yield closes in pool memory so screener avoids redeploying
         if (args.reason && args.reason.toLowerCase().includes("yield")) {
           const poolAddr = result.pool || args.pool_address;
           if (poolAddr) addPoolNote({ pool_address: poolAddr, note: `Closed: low yield (fee/TVL below threshold) at ${new Date().toISOString().slice(0,10)}` }).catch?.(() => {});
         }
         // Auto-swap base token back to SOL unless user said to hold
-        if (!args.skip_swap && result.base_mint) {
+        if (result.dual_token) {
+          result.auto_swap_note ||= "Dual-token exit swaps are managed by the durable recovery journal.";
+        } else if (!args.skip_swap && result.base_mint) {
           try {
             const balances = await getWalletBalances({});
             const token = balances.tokens?.find(t => t.mint === result.base_mint);
@@ -657,6 +680,20 @@ export async function executeTool(name, args) {
             log("executor_warn", `Auto-swap after close failed: ${e.message}`);
           }
         }
+        notifyClose({
+          pair: result.pool_name || args.position_address?.slice(0, 8),
+          pnlUsd: result.dual_token ? null : result.pnl_usd ?? 0,
+          pnlSol: result.dual_token ? result.pnl_sol ?? null : null,
+          pnlPct: result.dual_token ? result.dual_pnl?.netPnlPct ?? null : result.pnl_pct ?? 0,
+          dualToken: result.dual_token,
+          capitalPnlSol: result.dual_pnl?.capitalPnlSol,
+          feeIncomeSol: result.dual_pnl?.feeIncomeSol,
+          executionFeesSol: result.dual_pnl?.executionFeesSol,
+          unrecoveredRentSol: result.dual_pnl?.unrecoveredRentSol,
+          positionRentRecoveredSol: result.position_rent_recovered_sol,
+          exitSwapTransactions: result.exit_swap_txs,
+          autoSwapNote: result.auto_swap_note || (args.skip_swap && result.dual_token ? "Pool tokens left in wallet by request." : null),
+        }).catch(() => {});
       } else if (name === "claim_fees" && config.management.autoSwapAfterClaim && result.base_mint) {
         try {
           const balances = await getWalletBalances({});
@@ -700,6 +737,7 @@ async function runSafetyChecks(name, args) {
       const poolThresholds = await validateDeployPoolThresholds(args);
       if (!poolThresholds.pass) return poolThresholds;
       if (poolThresholds.entryMarketData) Object.assign(args, poolThresholds.entryMarketData);
+      if (poolThresholds.poolMints) Object.assign(args, { token_x_mint: poolThresholds.poolMints.x, token_y_mint: poolThresholds.poolMints.y });
 
       // Reject pools with bin_step out of configured range
       const minStep = config.screening.minBinStep;
@@ -713,7 +751,7 @@ async function runSafetyChecks(name, args) {
 
       const deployAmountY = Number(args.amount_y ?? args.amount_sol ?? 0);
       const deployAmountX = Number(args.amount_x ?? 0);
-      if (Number.isFinite(deployAmountX) && deployAmountX > 0) {
+      if (!config.strategy.dualToken.enabled && Number.isFinite(deployAmountX) && deployAmountX > 0) {
         return {
           pass: false,
           reason: "This agent only supports single-side SOL deploys. Use amount_y/amount_sol and keep amount_x=0.",
@@ -722,7 +760,8 @@ async function runSafetyChecks(name, args) {
       const requestedBinsBelow = Number(args.bins_below ?? config.strategy.defaultBinsBelow ?? config.strategy.minBinsBelow);
       const requestedBinsAbove = Number(args.bins_above ?? 0);
       const minBinsBelow = Math.max(MIN_SAFE_BINS_BELOW, Number(config.strategy.minBinsBelow ?? MIN_SAFE_BINS_BELOW));
-      const isSingleSidedSol = deployAmountY > 0 && deployAmountX <= 0;
+      const isDualToken = config.strategy.dualToken.enabled;
+      const isSingleSidedSol = !isDualToken && deployAmountY > 0 && deployAmountX <= 0;
       const requestedTotalBins = requestedBinsBelow + requestedBinsAbove;
       const requestedVolatility = args.volatility == null ? null : Number(args.volatility);
       if (args.volatility != null && (!Number.isFinite(requestedVolatility) || requestedVolatility <= 0)) {
@@ -741,12 +780,12 @@ async function runSafetyChecks(name, args) {
           !Number.isInteger(requestedBinsAbove) ||
           requestedBinsBelow < 0 ||
           requestedBinsAbove < 0 ||
-          requestedTotalBins < minBinsBelow
+          requestedTotalBins < (isDualToken ? config.strategy.dualToken.minTotalBins : minBinsBelow)
         )
       ) {
         return {
           pass: false,
-          reason: `deploy range ${requestedTotalBins} total bins is below minimum ${minBinsBelow}. Refusing 1-bin/tiny-range deploy.`,
+          reason: `deploy range ${requestedTotalBins} total bins is below configured minimum ${isDualToken ? config.strategy.dualToken.minTotalBins : minBinsBelow}. Refusing unsafe range.`,
         };
       }
       if (
@@ -797,6 +836,20 @@ async function runSafetyChecks(name, args) {
           return {
             pass: false,
             reason: `Already holding base token ${args.base_mint} in another pool. One position per token only.`,
+          };
+        }
+      }
+
+      if (isDualToken) {
+        const baseMints = new Set(config.strategy.dualToken.baseMints);
+        const candidates = [args.token_x_mint, args.token_y_mint].filter((mint) => mint && !baseMints.has(mint));
+        const occupiedToken = positions.positions.find((position) =>
+          candidates.some((mint) => mint === position.base_mint || mint === position.token_x_mint || mint === position.token_y_mint)
+        );
+        if (occupiedToken) {
+          return {
+            pass: false,
+            reason: `An open position already contains one of this dual pool's non-base tokens.`,
           };
         }
       }

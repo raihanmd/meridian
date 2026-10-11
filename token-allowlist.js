@@ -34,6 +34,20 @@ export function getPoolRestrictionReason(baseMint, quoteMint, allowlist) {
   return null;
 }
 
+export function getDualPoolRestrictionReason(mintX, mintY, allowlist, baseMints = [SOL_MINT]) {
+  if (!mintX || !mintY) return "pool token mints are missing";
+  if (mintX === mintY) return "pool token mints must be different";
+  if (!Array.isArray(allowlist) || allowlist.length === 0) {
+    return "tokenAllowlist is empty; add at least one approved non-base token";
+  }
+  const approved = new Set(allowlist.map((entry) => entry?.mint).filter(Boolean));
+  const bases = new Set(baseMints.filter(Boolean));
+  const unapproved = [mintX, mintY].filter((mint) => !bases.has(mint) && !approved.has(mint));
+  if (unapproved.length) return "every non-base pool token must be in tokenAllowlist";
+  if (![mintX, mintY].some((mint) => !bases.has(mint))) return "pool must contain at least one allowlisted non-base token";
+  return null;
+}
+
 export function getPoolAllowlistDisplay(baseMint, quoteMint, allowlist) {
   const baseAllowlisted = Array.isArray(allowlist) && allowlist.some((entry) => entry.mint === baseMint);
   const restriction = getPoolRestrictionReason(baseMint, quoteMint, allowlist);

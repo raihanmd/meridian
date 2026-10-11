@@ -467,8 +467,25 @@ export function stopPolling() {
 }
 
 // ─── Notification helpers ────────────────────────────────────────
-export async function notifyDeploy({ pair, amountSol, position, tx, priceRange, rangeCoverage, binStep, baseFee }) {
+export async function notifyDeploy({ pair, amountSol, position, tx, priceRange, rangeCoverage, binStep, baseFee, dualToken, tokenXMInt, tokenYMInt, amountX, amountY, strategy, transactionFeesSol, rentEstimateSol, reserveSol, ta, txs }) {
   if (hasActiveLiveMessage()) return;
+  if (dualToken) {
+    const rangeStr = priceRange
+      ? `Price range: ${priceRange.min < 0.0001 ? priceRange.min.toExponential(3) : priceRange.min.toFixed(6)} – ${priceRange.max < 0.0001 ? priceRange.max.toExponential(3) : priceRange.max.toFixed(6)}\n`
+      : "";
+    const transactions = Array.isArray(txs) ? txs : tx ? [tx] : [];
+    await sendHTML(
+      `✅ <b>Dual-token DLMM deployed</b> ${pair}\n` +
+      `Budget: ${amountSol} SOL (X ${amountX ?? "?"} · Y ${amountY ?? "?"})\n` +
+      `Distribution: ${strategy || "?"} | X <code>${tokenXMInt || "?"}</code> | Y <code>${tokenYMInt || "?"}</code>\n` +
+      rangeStr +
+      `Rent estimate: ${rentEstimateSol ?? "?"} SOL | Tx fees: ${transactionFeesSol ?? "?"} SOL | Reserve: ${reserveSol ?? "?"} SOL\n` +
+      (ta?.sixHour ? `TA 6h: range ${ta.sixHour.rangePct.toFixed(2)}%, trend ${ta.sixHour.netChangePct.toFixed(2)}%, efficiency ${ta.sixHour.directionalEfficiency.toFixed(2)}\n` : "") +
+      `Position: <code>${position?.slice(0, 10)}...</code>\n` +
+      `Transactions: ${transactions.map((signature) => `<code>${signature.slice(0, 12)}...</code>`).join(", ") || "pending"}`
+    );
+    return;
+  }
   const priceStr = priceRange
     ? `Price range: ${priceRange.min < 0.0001 ? priceRange.min.toExponential(3) : priceRange.min.toFixed(6)} – ${priceRange.max < 0.0001 ? priceRange.max.toExponential(3) : priceRange.max.toFixed(6)}\n`
     : "";
@@ -489,12 +506,23 @@ export async function notifyDeploy({ pair, amountSol, position, tx, priceRange, 
   );
 }
 
-export async function notifyClose({ pair, pnlUsd, pnlPct }) {
+export async function notifyClose({ pair, pnlUsd, pnlSol, pnlPct, dualToken, capitalPnlSol, feeIncomeSol, executionFeesSol, unrecoveredRentSol, positionRentRecoveredSol, autoSwapNote, exitSwapTransactions }) {
   if (hasActiveLiveMessage()) return;
-  const sign = pnlUsd >= 0 ? "+" : "";
+  const pnlValue = dualToken ? pnlSol : pnlUsd;
+  const sign = pnlValue >= 0 ? "+" : "";
+  const pnlLine = dualToken
+    ? pnlSol == null
+      ? "Net PnL: unavailable (position accounting data incomplete)"
+      : `Net PnL: ${sign}${pnlSol.toFixed(6)} SOL${pnlPct != null ? ` (${sign}${pnlPct.toFixed(2)}%)` : ""}`
+    : `PnL: ${sign}$${(pnlUsd ?? 0).toFixed(2)} (${sign}${(pnlPct ?? 0).toFixed(2)}%)`;
   await sendHTML(
-    `🔒 <b>Closed</b> ${pair}\n` +
-    `PnL: ${sign}$${(pnlUsd ?? 0).toFixed(2)} (${sign}${(pnlPct ?? 0).toFixed(2)}%)`
+    `${dualToken ? "🔒 <b>Dual-token position closed</b>" : "🔒 <b>Closed</b>"} ${pair}\n` +
+    pnlLine +
+    (dualToken && capitalPnlSol != null ? `\nCapital movement: ${capitalPnlSol.toFixed(6)} SOL | LP fees: ${(feeIncomeSol ?? 0).toFixed(6)} SOL` : "") +
+    (dualToken ? `\nExecution fees: ${(executionFeesSol ?? 0).toFixed(6)} SOL | Unrecovered rent: ${(unrecoveredRentSol ?? 0).toFixed(6)} SOL` : "") +
+    (positionRentRecoveredSol != null ? `\nPosition rent recovered: ${positionRentRecoveredSol.toFixed(6)} SOL` : "") +
+    (autoSwapNote ? `\n${autoSwapNote}` : "") +
+    (exitSwapTransactions?.length ? `\nExit swaps: ${exitSwapTransactions.map((signature) => `<code>${signature.slice(0, 12)}...</code>`).join(", ")}` : "")
   );
 }
 

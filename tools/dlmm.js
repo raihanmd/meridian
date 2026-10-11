@@ -9,6 +9,7 @@ import {
   VersionedTransaction,
   sendAndConfirmTransaction,
 } from "@solana/web3.js";
+import { getAssociatedTokenAddressSync } from "@solana/spl-token";
 import BN from "bn.js";
 import bs58 from "bs58";
 import { config, computeDeployAmount, MIN_SAFE_BINS_BELOW } from "../config.js";
@@ -25,12 +26,15 @@ import {
 } from "../state.js";
 import { recordPerformance } from "../lessons.js";
 import { isBaseMintOnCooldown, isPoolOnCooldown } from "../pool-memory.js";
-import { normalizeMint } from "./wallet.js";
+import { normalizeMint, quoteSolSwap, resumeJupiterSwap, swapToken } from "./wallet.js";
 import { appendDecision } from "../decision-log.js";
 import { agentMeridianJson, getAgentIdForRequests, getAgentMeridianHeaders } from "./agent-meridian.js";
 import { getAndClearStagedSignals } from "../signal-tracker.js";
 import { computePositions, fetchDlmmPnlForPool } from "./pnl.js";
-import { getPoolRestrictionReason } from "../token-allowlist.js";
+import { getDualPoolRestrictionReason, getPoolRestrictionReason } from "../token-allowlist.js";
+import { analyzeDualTokenRange, fetchDualTokenOhlcv } from "./dual-ta.js";
+import { buildDualDeployPlan, computeDualPnl, computeDualValueSplit, validateSwapOutcome } from "./dual-deploy.js";
+import { dualOperationJournal } from "./dual-operations.js";
 
 // ─── Lazy SDK loader ───────────────────────────────────────────
 // @meteora-ag/dlmm → @coral-xyz/anchor uses CJS directory imports
@@ -46,6 +50,8 @@ let _deriveBinArrayBitmapExtension = null;
 let _isOverflowDefaultBinArrayBitmap = null;
 let _BIN_ARRAY_FEE = null;
 let _BIN_ARRAY_BITMAP_FEE = null;
+let _calculateSpotDistribution = null;
+let _calculateNormalDistribution = null;
 
 async function getDLMM() {
   if (!_DLMM) {
@@ -60,6 +66,8 @@ async function getDLMM() {
     _isOverflowDefaultBinArrayBitmap = mod.isOverflowDefaultBinArrayBitmap;
     _BIN_ARRAY_FEE = mod.BIN_ARRAY_FEE;
     _BIN_ARRAY_BITMAP_FEE = mod.BIN_ARRAY_BITMAP_FEE;
+    _calculateSpotDistribution = mod.calculateSpotDistribution;
+    _calculateNormalDistribution = mod.calculateNormalDistribution;
   }
   return {
     DLMM: _DLMM,
@@ -72,6 +80,8 @@ async function getDLMM() {
     isOverflowDefaultBinArrayBitmap: _isOverflowDefaultBinArrayBitmap,
     BIN_ARRAY_FEE: _BIN_ARRAY_FEE,
     BIN_ARRAY_BITMAP_FEE: _BIN_ARRAY_BITMAP_FEE,
+    calculateSpotDistribution: _calculateSpotDistribution,
+    calculateNormalDistribution: _calculateNormalDistribution,
   };
 }
 
@@ -347,6 +357,759 @@ async function assertRangeDoesNotRequireBinArrayInitialization(pool, minBinId, m
   }
 }
 
+async function getMintBalanceRaw(owner, mint) {
+  if (mint === config.tokens.SOL) return (await getConnection().getBalance(owner, "confirmed")).toString();
+  const mintAccount = await getConnection().getAccountInfo(new PublicKey(mint), "confirmed");
+  if (!mintAccount) throw new Error(`Token mint ${mint} does not exist`);
+  const accounts = await getConnection().getParsedTokenAccountsByOwner(owner, { programId: mintAccount.owner }, "confirmed");
+  return accounts.value.reduce((total, account) => {
+    const info = account.account.data?.parsed?.info;
+    if (info?.mint !== mint) return total;
+    return total + BigInt(info?.tokenAmount?.amount || "0");
+  }, 0n).toString();
+}
+
+async function readSignatureStatus(signature) {
+  const response = await getConnection().getSignatureStatuses([signature], { searchTransactionHistory: true });
+  return response.value[0] ?? null;
+}
+
+async function getConfirmedTransactionFeeSol(signature) {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const transaction = await getConnection().getTransaction(signature, {
+      commitment: "confirmed",
+      maxSupportedTransactionVersion: 0,
+    }).catch(() => null);
+    if (transaction?.meta && Number.isFinite(transaction.meta.fee)) return transaction.meta.fee / 1e9;
+    if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 1000));
+  }
+  return null;
+}
+
+function sumRecordedDualTransactionFees(operation) {
+  const confirmed = (operation.transactions || []).filter((transaction) => transaction.status === "confirmed");
+  if (confirmed.some((transaction) => transaction.metadata?.feeSol == null || !Number.isFinite(Number(transaction.metadata.feeSol)))) return null;
+  return confirmed.reduce((total, transaction) => total + Number(transaction.metadata.feeSol), 0);
+}
+
+async function signedTransactionStillValid(signedTransaction) {
+  try {
+    const bytes = Buffer.from(signedTransaction, "base64");
+    const tx = VersionedTransaction.deserialize(bytes);
+    const blockhash = tx.message.recentBlockhash;
+    return (await getConnection().isBlockhashValid(blockhash, "confirmed")).value;
+  } catch {
+    try {
+      const tx = Transaction.from(Buffer.from(signedTransaction, "base64"));
+      if (!tx.recentBlockhash) return false;
+      return (await getConnection().isBlockhashValid(tx.recentBlockhash, "confirmed")).value;
+    } catch {
+      return false;
+    }
+  }
+}
+
+async function finalizeDualPosition(operation, pool, wallet) {
+  const plan = operation.plan;
+  const xRaw = operation.amountXRaw ?? operation.acquiredRaw?.x;
+  const yRaw = operation.amountYRaw ?? operation.acquiredRaw?.y;
+  const decimalsX = operation.tokenDecimals?.x;
+  const decimalsY = operation.tokenDecimals?.y;
+  if (!operation.positionAddress || !xRaw || !yRaw || !Number.isInteger(decimalsX) || !Number.isInteger(decimalsY)) {
+    throw new Error(`Dual operation ${operation.id} lacks persisted position or amount details`);
+  }
+  const recordedFees = sumRecordedDualTransactionFees(operation);
+  const transactionFeesSol = recordedFees === null ? null : recordedFees ?? operation.transactionFeesSol ?? null;
+  trackPosition({
+    position: operation.positionAddress, pool: operation.poolAddress, pool_name: plan.pool_name,
+    strategy: plan.strategy,
+    bin_range: { min: plan.min_bin_id, max: plan.max_bin_id, bins_below: plan.bins_below, bins_above: plan.bins_above },
+    amount_sol: plan.amount_sol,
+    amount_x: Number(xRaw) / 10 ** decimalsX,
+    active_bin: plan.active_bin, bin_step: plan.bin_step, volatility: plan.volatility,
+    fee_tvl_ratio: plan.fee_tvl_ratio, organic_score: plan.organic_score, initial_value_usd: plan.initial_value_usd,
+    entry_mcap: plan.entry_mcap, entry_tvl: plan.entry_tvl, entry_volume: plan.entry_volume, entry_holders: plan.entry_holders,
+    token_x_mint: plan.token_x_mint, token_y_mint: plan.token_y_mint, dual_token: true,
+    dual_deploy: {
+      amount_sol: plan.amount_sol, x_raw: String(xRaw), y_raw: String(yRaw), x_decimals: decimalsX, y_decimals: decimalsY,
+      swaps: operation.swapResults || {}, position_rent_estimate_sol: operation.positionRentSol,
+      ata_rent_budget_sol: plan.ata_rent_budget_sol, ta: plan.ta.metrics,
+      transaction_fees_sol: transactionFeesSol,
+      fee_accounting_complete: transactionFeesSol != null,
+    },
+  });
+  await dualOperationJournal.transition(operation.id, "completed", { completedAt: new Date().toISOString() });
+  _positionsCacheAt = 0;
+  return {
+    success: true, dual_token: true, position: operation.positionAddress, pool: operation.poolAddress,
+    pool_name: plan.pool_name, strategy: plan.strategy,
+    bin_range: { min: plan.min_bin_id, max: plan.max_bin_id, active: plan.active_bin },
+    price_range: plan.price_range, amount_sol: plan.amount_sol,
+    token_x_mint: plan.token_x_mint, token_y_mint: plan.token_y_mint,
+    amount_x: Number(xRaw) / 10 ** decimalsX, amount_y: Number(yRaw) / 10 ** decimalsY,
+    txs: [...Object.values(operation.swapResults || {}).map((result) => result.tx).filter(Boolean), operation.positionSignature],
+    rent_estimate_sol: operation.positionRentSol, reserve_sol: operation.reserveSol,
+    transaction_fees_sol: transactionFeesSol, fee_accounting_complete: transactionFeesSol != null, ta: plan.ta.metrics,
+  };
+}
+
+async function reconcileDualOperation(operation, pool, wallet) {
+  const unresolved = (operation.transactions || []).filter((transaction) => transaction.status === "signed");
+  for (const transaction of unresolved) {
+    const status = await readSignatureStatus(transaction.signature);
+    if (status?.err) {
+      await dualOperationJournal.recordTransaction(operation.id, { ...transaction, status: "failed", metadata: { rpcError: status.err } });
+      continue;
+    }
+    if (status?.confirmationStatus === "confirmed" || status?.confirmationStatus === "finalized") {
+      const feeSol = transaction.metadata?.feeSol ?? await getConfirmedTransactionFeeSol(transaction.signature);
+      await dualOperationJournal.recordTransaction(operation.id, { ...transaction, status: "confirmed", metadata: { feeSol } });
+      operation.transactionFeesSol = sumRecordedDualTransactionFees(await dualOperationJournal.get(operation.id));
+      if (transaction.kind.startsWith("swap_")) {
+        const side = transaction.kind.slice(-1);
+        const mint = side === "x" ? operation.plan.token_x_mint : operation.plan.token_y_mint;
+        const baseline = BigInt(transaction.metadata?.baselineRaw ?? operation.tokenBaselineRaw?.[side] ?? "0");
+        const current = BigInt(await getMintBalanceRaw(wallet.publicKey, mint));
+        if (current > baseline) operation.acquiredRaw = { ...(operation.acquiredRaw || {}), [side]: (current - baseline).toString() };
+      } else if (transaction.kind.startsWith("rollback_")) {
+        const side = transaction.kind.slice(-1);
+        operation.acquiredRaw = { ...(operation.acquiredRaw || {}), [side]: "0" };
+      }
+      await dualOperationJournal.transition(operation.id, "recovery_pending", {
+        acquiredRaw: operation.acquiredRaw || { x: "0", y: "0" },
+        transactionFeesSol: operation.transactionFeesSol,
+      });
+      continue;
+    }
+
+    const signed = transaction.metadata?.signedTransaction;
+    if (!signed || !(await signedTransactionStillValid(signed))) {
+      await dualOperationJournal.recordTransaction(operation.id, { ...transaction, status: "expired" });
+      if (transaction.kind.startsWith("swap_")) {
+        const side = transaction.kind.slice(-1);
+        const mint = side === "x" ? operation.plan.token_x_mint : operation.plan.token_y_mint;
+        const baseline = BigInt(transaction.metadata?.baselineRaw ?? operation.tokenBaselineRaw?.[side] ?? "0");
+        const current = BigInt(await getMintBalanceRaw(wallet.publicKey, mint));
+        operation.acquiredRaw = {
+          ...(operation.acquiredRaw || {}),
+          [side]: current > baseline ? (current - baseline).toString() : "0",
+        };
+        await dualOperationJournal.transition(operation.id, "recovery_pending", { acquiredRaw: operation.acquiredRaw });
+      }
+      continue;
+    }
+    if (transaction.kind.startsWith("rollback_")) {
+      const result = await resumeJupiterSwap({ signedTransaction: signed, requestId: transaction.metadata.requestId }).catch(() => null);
+      if (result?.success) {
+        if (result.tx !== transaction.signature) throw new Error("Jupiter rollback resume returned a different journaled signature");
+        const feeSol = await getConfirmedTransactionFeeSol(transaction.signature);
+        await dualOperationJournal.recordTransaction(operation.id, { ...transaction, status: "confirmed", metadata: { ...result, feeSol } });
+        const side = transaction.kind.slice(-1);
+        operation.acquiredRaw = { ...(operation.acquiredRaw || {}), [side]: "0" };
+        await dualOperationJournal.transition(operation.id, "recovery_pending", { acquiredRaw: operation.acquiredRaw });
+      }
+      continue;
+    }
+    const result = await resumeJupiterSwap({ signedTransaction: signed, requestId: transaction.metadata.requestId }).catch(() => null);
+    if (result?.success) {
+      if (result.tx !== transaction.signature) throw new Error("Jupiter resume returned a different signature than the journaled transaction");
+      const side = transaction.kind.slice(-1);
+      const mint = side === "x" ? operation.plan.token_x_mint : operation.plan.token_y_mint;
+      const baseline = BigInt(transaction.metadata?.baselineRaw ?? operation.tokenBaselineRaw?.[side] ?? "0");
+      const current = BigInt(await getMintBalanceRaw(wallet.publicKey, mint));
+      const acquired = current > baseline ? (current - baseline).toString() : "0";
+      operation.acquiredRaw = { ...(operation.acquiredRaw || {}), [side]: acquired };
+      operation.swapResults = { ...(operation.swapResults || {}), [side]: result };
+      const feeSol = await getConfirmedTransactionFeeSol(transaction.signature);
+      await dualOperationJournal.recordTransaction(operation.id, { ...transaction, status: "confirmed", metadata: { ...result, feeSol } });
+      operation.transactionFeesSol = sumRecordedDualTransactionFees(await dualOperationJournal.get(operation.id));
+      await dualOperationJournal.transition(operation.id, "recovery_pending", { acquiredRaw: operation.acquiredRaw, swapResults: operation.swapResults, transactionFeesSol: operation.transactionFeesSol });
+    }
+  }
+
+  operation = await dualOperationJournal.get(operation.id);
+  if (operation.positionSignature) {
+    const status = await readSignatureStatus(operation.positionSignature);
+    if (status && !status.err && (status.confirmationStatus === "confirmed" || status.confirmationStatus === "finalized")) {
+      const feeSol = await getConfirmedTransactionFeeSol(operation.positionSignature);
+      await dualOperationJournal.recordTransaction(operation.id, { kind: "add_liquidity", signature: operation.positionSignature, status: "confirmed", metadata: { feeSol } });
+      operation.transactionFeesSol = sumRecordedDualTransactionFees(await dualOperationJournal.get(operation.id));
+      await dualOperationJournal.transition(operation.id, "recovery_pending", { transactionFeesSol: operation.transactionFeesSol });
+      return finalizeDualPosition(await dualOperationJournal.get(operation.id), pool, wallet);
+    }
+    if (!status && operation.positionTransaction && Number(operation.lastValidBlockHeight) >= await getConnection().getBlockHeight("confirmed")) {
+      try {
+        await getConnection().sendRawTransaction(Buffer.from(operation.positionTransaction, "base64"), { skipPreflight: false, maxRetries: 3 });
+        const confirmed = await getConnection().confirmTransaction({ signature: operation.positionSignature, blockhash: Transaction.from(Buffer.from(operation.positionTransaction, "base64")).recentBlockhash, lastValidBlockHeight: operation.lastValidBlockHeight }, "confirmed");
+        if (!confirmed.value.err) return finalizeDualPosition(operation, pool, wallet);
+      } catch (error) {
+        log("dual_recovery_warn", `Could not resume DLMM transaction ${operation.positionSignature}: ${error.message}`);
+      }
+    }
+    if (!status && operation.positionAddress) {
+      const positionAccount = await getConnection().getAccountInfo(new PublicKey(operation.positionAddress), "confirmed").catch(() => null);
+      if (positionAccount) {
+        try {
+          const positionData = await pool.getPosition(new PublicKey(operation.positionAddress));
+          const bins = positionData?.positionData?.positionBinData || [];
+          if (bins.some((bin) => new BN(bin.positionLiquidity || "0").gt(new BN(0)))) {
+            const feeSol = await getConfirmedTransactionFeeSol(operation.positionSignature);
+            await dualOperationJournal.recordTransaction(operation.id, {
+              kind: "add_liquidity", signature: operation.positionSignature, status: "confirmed",
+              metadata: { recoveredFromPositionAccount: true, feeSol },
+            });
+            return finalizeDualPosition(await dualOperationJournal.get(operation.id), pool, wallet);
+          }
+          if (Number(operation.lastValidBlockHeight) < await getConnection().getBlockHeight("confirmed")) {
+            const closeTx = await pool.closePosition({ owner: wallet.publicKey, position: { publicKey: new PublicKey(operation.positionAddress) } });
+            const closeSignature = await sendAndConfirmTransaction(getConnection(), closeTx, [wallet]);
+            await dualOperationJournal.recordTransaction(operation.id, { kind: "close_empty_position", signature: closeSignature, status: "confirmed" });
+          }
+        } catch (error) {
+          return { success: false, recovery_pending: true, operation_id: operation.id, error: `Position account exists but its liquidity cannot yet be verified: ${error.message}` };
+        }
+      } else if (Number(operation.lastValidBlockHeight) < await getConnection().getBlockHeight("confirmed")) {
+        await dualOperationJournal.recordTransaction(operation.id, { kind: "add_liquidity", signature: operation.positionSignature, status: "expired" });
+      }
+    }
+    if (!status && Number(operation.lastValidBlockHeight) >= await getConnection().getBlockHeight("confirmed")) {
+      return { success: false, recovery_pending: true, operation_id: operation.id, error: "DLMM transaction outcome is still being reconciled" };
+    }
+    if (status && !status.err && status.confirmationStatus !== "confirmed" && status.confirmationStatus !== "finalized") {
+      return { success: false, recovery_pending: true, operation_id: operation.id, error: "DLMM transaction outcome is still being reconciled" };
+    }
+  }
+
+  operation = await dualOperationJournal.get(operation.id);
+  const acquiredRaw = { x: "0", y: "0", ...(operation.acquiredRaw || {}) };
+  for (const side of ["x", "y"]) {
+    const amountRaw = BigInt(acquiredRaw[side] || "0");
+    const mint = side === "x" ? operation.plan.token_x_mint : operation.plan.token_y_mint;
+    if (amountRaw <= 0n || mint === config.tokens.SOL) continue;
+    try {
+      const info = await getConnection().getParsedAccountInfo(new PublicKey(mint), "confirmed");
+      const decimals = info.value?.data?.parsed?.info?.decimals;
+      if (!Number.isInteger(decimals)) throw new Error("Token decimals are unavailable");
+      const returned = await swapToken({
+        input_mint: mint,
+        output_mint: config.tokens.SOL,
+        amount_raw: amountRaw.toString(),
+        input_decimals: decimals,
+        onPrepared: async (prepared) => {
+          operation.rollbackSignatures ??= {};
+          operation.rollbackSignatures[side] = prepared.signature;
+          await dualOperationJournal.recordTransaction(operation.id, {
+            kind: `rollback_${side}`, signature: prepared.signature, status: "signed",
+            metadata: { ...prepared, baselineRaw: "0" },
+          });
+        },
+      });
+      if (!returned?.success) throw new Error(returned?.error || "Rollback swap failed");
+      if (returned.tx !== operation.rollbackSignatures?.[side]) throw new Error("Rollback returned a different signature than the journaled transaction");
+      await dualOperationJournal.recordTransaction(operation.id, { kind: `rollback_${side}`, signature: returned.tx, status: "confirmed", metadata: returned });
+      acquiredRaw[side] = "0";
+      await dualOperationJournal.transition(operation.id, "recovery_pending", { acquiredRaw: { ...acquiredRaw } });
+    } catch (error) {
+      await dualOperationJournal.transition(operation.id, "recovery_pending", { acquiredRaw: { ...acquiredRaw }, recoveryError: error.message });
+      return { success: false, recovery_pending: true, operation_id: operation.id, error: error.message };
+    }
+  }
+  const finalState = await dualOperationJournal.get(operation.id);
+  if ((finalState.transactions || []).some((transaction) => transaction.status === "signed")) {
+    return { success: false, recovery_pending: true, operation_id: operation.id, error: "A submitted transaction still needs chain confirmation" };
+  }
+  await dualOperationJournal.transition(operation.id, "cancelled", { acquiredRaw: { ...acquiredRaw }, cancelledAt: new Date().toISOString() });
+  return { success: false, recovery_pending: false, operation_id: operation.id, recovered: true, error: "Previous dual-token deploy was rolled back to SOL; start a fresh screening cycle" };
+}
+
+async function executeOrResumeDualExit({ positionAddress, poolAddress, wallet, assets, positionRentRecoveredSol = null }) {
+  return dualOperationJournal.withPoolLock(poolAddress, wallet.publicKey.toString(), async () => {
+    let operation = (await dualOperationJournal.list({ includeTerminal: true }))
+      .find((entry) => entry.idempotencyKey === `dual-exit:${positionAddress}`);
+    if (!operation) {
+      operation = await dualOperationJournal.create({
+        idempotencyKey: `dual-exit:${positionAddress}`,
+        poolAddress,
+        walletAddress: wallet.publicKey.toString(),
+        kind: "exit",
+        positionAddress,
+        assetsRemaining: Object.fromEntries(assets.map((asset) => [asset.mint, { ...asset }])),
+        solReceivedLamports: "0",
+        positionRentRecoveredSol,
+        transactionFeesSol: 0,
+      });
+    }
+    if (operation.stage === "completed") return operation;
+    if (operation.stage === "cancelled") throw new Error("Dual exit was already cancelled; manual reconciliation is required");
+
+    const applyConfirmedExitSwap = async (transaction, result) => {
+      const expected = transaction.metadata?.amountRaw;
+      const minimum = transaction.metadata?.minAmountOut;
+      const outcome = validateSwapOutcome({
+        expectedInputLamports: expected,
+        actualInputLamports: result.amount_in,
+        minOutput: minimum,
+        actualOutput: result.amount_out,
+      });
+      if (result.tx !== transaction.signature) throw new Error("Dual exit swap signature differs from journaled transaction");
+      const feeSol = await getConfirmedTransactionFeeSol(transaction.signature);
+      await dualOperationJournal.recordTransaction(operation.id, {
+        ...transaction,
+        status: "confirmed",
+        metadata: { ...result, feeSol, minAmountOut: minimum },
+      });
+      const current = await dualOperationJournal.get(operation.id);
+      const assetsRemaining = { ...current.assetsRemaining };
+      const asset = assetsRemaining[transaction.metadata.mint];
+      if (asset) asset.amount_raw = "0";
+      await dualOperationJournal.transition(operation.id, "exit_swaps_pending", {
+        assetsRemaining,
+        solReceivedLamports: (BigInt(current.solReceivedLamports || "0") + BigInt(outcome.outputLamports)).toString(),
+        transactionFeesSol: sumRecordedDualTransactionFees(await dualOperationJournal.get(operation.id)),
+      });
+    };
+
+    for (const transaction of (operation.transactions || []).filter((entry) => entry.status === "signed" && entry.kind.startsWith("exit_swap:"))) {
+      const status = await readSignatureStatus(transaction.signature);
+      if (status?.err) {
+        await dualOperationJournal.recordTransaction(operation.id, { ...transaction, status: "failed", metadata: { rpcError: status.err } });
+        continue;
+      }
+      if (status?.confirmationStatus === "confirmed" || status?.confirmationStatus === "finalized") {
+        const signed = transaction.metadata?.signedTransaction;
+        if (signed && transaction.metadata?.requestId) {
+          const resumed = await resumeJupiterSwap({ signedTransaction: signed, requestId: transaction.metadata.requestId }).catch(() => null);
+          if (resumed?.success) {
+            if (resumed.tx !== transaction.signature) throw new Error("Confirmed Jupiter exit returned a different journaled signature");
+            await applyConfirmedExitSwap(transaction, resumed);
+            operation = await dualOperationJournal.get(operation.id);
+            continue;
+          }
+        }
+        const chainTx = await getConnection().getTransaction(transaction.signature, { commitment: "confirmed", maxSupportedTransactionVersion: 0 }).catch(() => null);
+        const owner = wallet.publicKey.toString();
+        const keys = (chainTx?.transaction?.message?.accountKeys || []).map((key) =>
+          typeof key === "string" ? key : key.pubkey?.toString?.() || key.toString?.()
+        );
+        const ownerIndex = keys.indexOf(owner);
+        const delta = ownerIndex >= 0 && chainTx?.meta?.postBalances?.[ownerIndex] != null && chainTx?.meta?.preBalances?.[ownerIndex] != null
+          ? Number(chainTx.meta.postBalances[ownerIndex]) - Number(chainTx.meta.preBalances[ownerIndex]) + Number(chainTx.meta.fee || 0)
+          : 0;
+        if (delta <= 0) return { stage: "recovery_pending", operation_id: operation.id, error: "Confirmed exit swap has no verifiable SOL credit yet" };
+        await applyConfirmedExitSwap(transaction, {
+          success: true,
+          tx: transaction.signature,
+          amount_in: transaction.metadata.amountRaw,
+          amount_out: String(delta),
+          output_amount_source: "owner_balance_delta_including_recoverable_account_lamports",
+        });
+        operation = await dualOperationJournal.get(operation.id);
+        continue;
+      }
+      const signed = transaction.metadata?.signedTransaction;
+      if (!signed || !(await signedTransactionStillValid(signed))) {
+        await dualOperationJournal.recordTransaction(operation.id, { ...transaction, status: "expired" });
+        continue;
+      }
+      const resumed = await resumeJupiterSwap({ signedTransaction: signed, requestId: transaction.metadata.requestId }).catch(() => null);
+      if (resumed?.success) {
+        if (resumed.tx !== transaction.signature) throw new Error("Resumed exit swap has a different signature");
+        await applyConfirmedExitSwap(transaction, resumed);
+        operation = await dualOperationJournal.get(operation.id);
+      }
+    }
+
+    operation = await dualOperationJournal.get(operation.id);
+    if ((operation.transactions || []).some((transaction) => transaction.status === "signed" && transaction.kind.startsWith("exit_swap:"))) {
+      return { stage: "recovery_pending", operation_id: operation.id, error: "A submitted exit swap is still awaiting chain confirmation" };
+    }
+    await dualOperationJournal.transition(operation.id, "exit_swaps_pending", {});
+    for (const asset of Object.values(operation.assetsRemaining || {})) {
+      if (BigInt(asset.amount_raw || "0") <= 0n) continue;
+      let prepared = null;
+      const result = await swapToken({
+        input_mint: asset.mint,
+        output_mint: config.tokens.SOL,
+        amount_raw: asset.amount_raw,
+        input_decimals: asset.decimals,
+        slippage_bps: config.strategy.dualToken.maxSlippageBps,
+        onPrepared: async (quote) => {
+          prepared = quote;
+          if (quote.price_impact_pct > config.strategy.dualToken.maxPriceImpactPct) throw new Error(`Exit swap impact ${quote.price_impact_pct.toFixed(3)}% exceeds the configured limit`);
+          await dualOperationJournal.recordTransaction(operation.id, {
+            kind: `exit_swap:${asset.mint}`,
+            signature: quote.signature,
+            status: "signed",
+            metadata: { ...quote, mint: asset.mint, amountRaw: asset.amount_raw, minAmountOut: quote.min_amount_out },
+          });
+        },
+      });
+      if (!result?.success) {
+        operation = await dualOperationJournal.get(operation.id);
+        return { stage: "recovery_pending", operation_id: operation.id, error: result?.error || "Exit swap is pending reconciliation" };
+      }
+      if (result.tx !== prepared?.signature) throw new Error("Dual exit execution returned a signature different from its journaled transaction");
+      const transaction = await dualOperationJournal.get(operation.id).then((current) => current.transactions.find((entry) => entry.signature === prepared?.signature));
+      if (!transaction) return { stage: "recovery_pending", operation_id: operation.id, error: "Exit swap succeeded but its signed intent is missing from the journal" };
+      await applyConfirmedExitSwap(transaction, result);
+      operation = await dualOperationJournal.get(operation.id);
+    }
+    operation = await dualOperationJournal.get(operation.id);
+    const remaining = Object.values(operation.assetsRemaining || {}).filter((asset) => BigInt(asset.amount_raw || "0") > 0n);
+    if (remaining.length) return { stage: "recovery_pending", operation_id: operation.id, error: "Some pool tokens still need conversion to SOL" };
+    const completed = await dualOperationJournal.transition(operation.id, "completed", { completedAt: new Date().toISOString() });
+    return completed;
+  });
+}
+
+async function reconcilePendingDualExits(wallet = getWallet()) {
+  const pending = (await dualOperationJournal.list()).filter((operation) => operation.kind === "exit");
+  for (const operation of pending) {
+    if (operation.walletAddress !== wallet.publicKey.toString()) continue;
+    try {
+      const result = await executeOrResumeDualExit({
+        positionAddress: operation.positionAddress,
+        poolAddress: operation.poolAddress,
+        wallet,
+        assets: [],
+        positionRentRecoveredSol: operation.positionRentRecoveredSol ?? null,
+      });
+      if (result.stage !== "completed") {
+        log("dual_exit_pending", `Exit ${operation.positionAddress.slice(0, 8)} remains pending: ${result.error || "one or more token swaps need retry"}`);
+      }
+    } catch (error) {
+      log("dual_exit_warn", `Could not resume exit ${operation.positionAddress.slice(0, 8)}: ${error.message}`);
+    }
+  }
+}
+
+async function deployDualTokenPosition(args) {
+  const poolAddress = normalizeMint(args.pool_address);
+  const wallet = getWallet();
+  await reconcilePendingDualExits(wallet);
+  return dualOperationJournal.withPoolLock(poolAddress, wallet.publicKey.toString(), () => deployDualTokenPositionLocked(args));
+}
+
+async function deployDualTokenPositionLocked(args) {
+  const poolAddress = normalizeMint(args.pool_address);
+  if (isPoolOnCooldown(poolAddress)) return { success: false, error: "Pool is on cooldown" };
+  const pool = await getPool(poolAddress);
+  const mintX = pool.lbPair.tokenXMint.toString();
+  const mintY = pool.lbPair.tokenYMint.toString();
+  const policyReason = getDualPoolRestrictionReason(mintX, mintY, config.screening.tokenAllowlist, config.strategy.dualToken.baseMints);
+  if (policyReason) throw new Error(`Pool blocked: ${policyReason}`);
+  const splTokenProgram = new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
+  for (const mint of [mintX, mintY].filter((address) => address !== config.tokens.SOL)) {
+    const mintAccount = await getConnection().getAccountInfo(new PublicKey(mint), "confirmed");
+    if (!mintAccount || !mintAccount.owner.equals(splTokenProgram)) {
+      throw new Error(`Dual-token deployment currently supports only standard SPL Token mints; refusing ${mint.slice(0, 8)}`);
+    }
+  }
+
+  const wallet = getWallet();
+  const pendingExit = (await dualOperationJournal.list()).find((operation) => operation.kind === "exit" && operation.poolAddress === poolAddress && operation.walletAddress === wallet.publicKey.toString());
+  if (pendingExit) return { success: false, recovery_pending: true, operation_id: pendingExit.id, error: "A prior dual-token exit is still converting withdrawn assets to SOL" };
+  const pending = (await dualOperationJournal.list()).find((operation) => operation.kind !== "exit" && operation.poolAddress === poolAddress && operation.walletAddress === wallet.publicKey.toString());
+  if (pending) {
+    return reconcileDualOperation(pending, pool, wallet);
+  }
+
+  const active = await pool.getActiveBin();
+  const binStep = Number(pool.lbPair.binStep);
+  const { calculateSpotDistribution, calculateNormalDistribution, StrategyType, getPriceOfBinByBinId } = await getDLMM();
+  const ohlcv = await fetchDualTokenOhlcv(poolAddress);
+  if (!ohlcv.ok) throw new Error(`Dual-token TA unavailable: ${ohlcv.reason}`);
+  const ta = analyzeDualTokenRange({
+    candles: ohlcv.candles,
+    activeBin: active.binId,
+    binStep,
+    ...config.strategy.dualToken,
+  });
+  if (!ta.eligible) throw new Error(`Dual-token deployment skipped: ${ta.reason}`);
+  if (ta.binsBelow + ta.binsAbove > 69 || ta.binsBelow < config.strategy.dualToken.minBinsPerSide || ta.binsAbove < config.strategy.dualToken.minBinsPerSide) {
+    throw new Error("Dual-token TA range violates configured side-width or atomic range limits");
+  }
+
+  const minBinId = ta.minBinId;
+  const maxBinId = ta.maxBinId;
+  await assertRangeDoesNotRequireBinArrayInitialization(pool, minBinId, maxBinId);
+  const rangeStrategy = ta.strategy === "spot" ? StrategyType.Spot : StrategyType.Curve;
+  const binIds = Array.from({ length: maxBinId - minBinId + 1 }, (_, index) => minBinId + index);
+  const distribution = ta.strategy === "spot"
+    ? calculateSpotDistribution(active.binId, binIds)
+    : calculateNormalDistribution(active.binId, binIds);
+  const valueSplit = computeDualValueSplit({ distribution, activeBin: active.binId, binStep });
+  const requestedBudget = Number(args.amount_sol ?? args.amount_y ?? computeDeployAmount((await getWalletBalances()).sol));
+  if (!Number.isFinite(requestedBudget) || requestedBudget <= 0) throw new Error("Dual-token deploy needs a positive SOL budget");
+
+  const creationQuote = await pool.quoteCreatePosition({ strategy: { minBinId, maxBinId } });
+  if (Number(creationQuote.binArrayCost ?? 0) > 0 || Number(creationQuote.bitmapExtensionCost ?? 0) > 0) {
+    throw new Error("Dual-token range requires non-refundable bin-array rent; refusing deployment");
+  }
+  const positionRentSol = Number(creationQuote.positionCost ?? 0) + Number(creationQuote.positionReallocCost ?? 0);
+  const ataRentLamports = await getConnection().getMinimumBalanceForRentExemption(165, "confirmed");
+  let temporaryAccountReserveLamports = 0;
+  for (const mint of [mintX, mintY].filter((address) => address !== config.tokens.SOL)) {
+    const account = getAssociatedTokenAddressSync(new PublicKey(mint), wallet.publicKey);
+    if (!(await getConnection().getAccountInfo(account, "confirmed"))) temporaryAccountReserveLamports += ataRentLamports;
+  }
+  const temporaryAccountReserveSol = temporaryAccountReserveLamports / 1e9;
+  const reserveSol = config.management.gasReserve + positionRentSol + temporaryAccountReserveSol + config.strategy.dualToken.maxTransactionFeesSol;
+  const walletSol = (await getConnection().getBalance(wallet.publicKey, "confirmed")) / 1e9;
+  const plan = buildDualDeployPlan({
+    mintX, mintY, solMint: config.tokens.SOL,
+    amountSol: requestedBudget,
+    walletSol,
+    reserveSol,
+    valueSplit,
+    routes: Object.fromEntries([mintX, mintY].filter((mint) => mint !== config.tokens.SOL).map((mint) => [mint, true])),
+  });
+
+  const quotes = {};
+  for (const swap of plan.swaps) {
+    const quote = await quoteSolSwap({ output_mint: swap.outputMint, amount_sol: swap.inputSol });
+    if (quote.price_impact_pct > config.strategy.dualToken.maxPriceImpactPct) {
+      throw new Error(`Jupiter price impact ${quote.price_impact_pct.toFixed(3)}% for ${swap.outputMint.slice(0, 8)} exceeds ${config.strategy.dualToken.maxPriceImpactPct}%`);
+    }
+    quotes[swap.side] = quote;
+  }
+
+  const minPrice = Number(getPriceOfBinByBinId(minBinId, binStep).toString());
+  const maxPrice = Number(getPriceOfBinByBinId(maxBinId, binStep).toString());
+  const activePrice = Number(getPriceOfBinByBinId(active.binId, binStep).toString());
+  const deployPlan = {
+    pool_address: poolAddress,
+    pool_name: args.pool_name || poolAddress.slice(0, 8),
+    dual_token: true,
+    token_x_mint: mintX,
+    token_y_mint: mintY,
+    strategy: ta.strategy,
+    bins_below: ta.binsBelow,
+    bins_above: ta.binsAbove,
+    min_bin_id: minBinId,
+    max_bin_id: maxBinId,
+    active_bin: active.binId,
+    active_price: activePrice,
+    price_range: { min: minPrice, max: maxPrice },
+    amount_sol: requestedBudget,
+    x_value_share: valueSplit.xValueShare,
+    y_value_share: valueSplit.yValueShare,
+    swaps: plan.swaps.map((swap) => ({ ...swap, quote: quotes[swap.side] })),
+    reserve_sol: reserveSol,
+    position_rent_estimate_sol: positionRentSol,
+    ata_rent_budget_sol: temporaryAccountReserveSol,
+    ata_rent_lamports: temporaryAccountReserveLamports,
+    bin_step: binStep,
+    volatility: args.volatility,
+    fee_tvl_ratio: args.fee_tvl_ratio,
+    organic_score: args.organic_score,
+    initial_value_usd: args.initial_value_usd,
+    entry_mcap: args.entry_mcap,
+    entry_tvl: args.entry_tvl,
+    entry_volume: args.entry_volume,
+    entry_holders: args.entry_holders,
+    ta,
+  };
+  if (process.env.DRY_RUN === "true") {
+    return { dry_run: true, would_deploy: deployPlan, message: "DRY RUN — no transaction sent" };
+  }
+
+  const nowKey = new Date().toISOString().replace(/[^0-9]/g, "").slice(0, 14);
+  const operation = await dualOperationJournal.create({
+    idempotencyKey: `dual:${wallet.publicKey}:${poolAddress}:${nowKey}`,
+    poolAddress,
+    walletAddress: wallet.publicKey.toString(),
+    plan: deployPlan,
+    quotes,
+    positionRentSol,
+    reserveSol,
+  });
+  const acquiredRaw = { x: "0", y: "0" };
+  const tokenBaselineRaw = {};
+  const swapResults = {};
+  try {
+    for (const swap of plan.swaps) {
+      const quote = quotes[swap.side];
+      const pendingStage = swap.side === "x" ? "swap_x_pending" : "swap_y_pending";
+      const baselineRaw = await getMintBalanceRaw(wallet.publicKey, swap.outputMint);
+      tokenBaselineRaw[swap.side] = baselineRaw;
+      await dualOperationJournal.transition(operation.id, pendingStage, {
+        acquiredRaw: { ...acquiredRaw },
+        tokenBaselineRaw: { ...tokenBaselineRaw },
+        currentSwapSide: swap.side,
+      });
+      let preparedSignature = null;
+      const result = await swapToken({
+        input_mint: config.tokens.SOL,
+        output_mint: swap.outputMint,
+        amount: swap.inputSol,
+        onPrepared: async (prepared) => {
+          preparedSignature = prepared.signature;
+          const expectedMin = BigInt(quote.min_out_amount);
+          const currentMin = BigInt(prepared.min_amount_out || prepared.amount_out || "0");
+          if (prepared.price_impact_pct > config.strategy.dualToken.maxPriceImpactPct) throw new Error("Updated Jupiter quote exceeds the configured price-impact limit");
+          if (currentMin < expectedMin) throw new Error("Jupiter quote worsened beyond the original preflight minimum");
+          await dualOperationJournal.recordTransaction(operation.id, {
+            kind: `swap_${swap.side}`,
+            signature: prepared.signature,
+            status: "signed",
+            metadata: { ...prepared, quote: { ...quote }, baselineRaw },
+          });
+        },
+      });
+      if (!result?.success) throw new Error(result?.error || `Jupiter ${swap.side.toUpperCase()} swap failed`);
+      if (result.tx !== preparedSignature) {
+        throw new Error("Jupiter execution returned a signature that differs from the journaled signed transaction");
+      }
+      const outcome = validateSwapOutcome({
+        expectedInputLamports: quote.in_amount,
+        actualInputLamports: result.amount_in,
+        minOutput: quote.min_out_amount,
+        actualOutput: result.amount_out,
+      });
+      acquiredRaw[swap.side] = outcome.outputLamports;
+      const swapFeeSol = await getConfirmedTransactionFeeSol(result.tx);
+      await dualOperationJournal.recordTransaction(operation.id, { kind: `swap_${swap.side}`, signature: result.tx, status: "confirmed", metadata: { ...result, feeSol: swapFeeSol } });
+      operation.transactionFeesSol = sumRecordedDualTransactionFees(await dualOperationJournal.get(operation.id));
+      const confirmedStage = swap.side === "x" ? "swap_x_confirmed" : "swap_y_confirmed";
+      swapResults[swap.side] = result;
+      await dualOperationJournal.transition(operation.id, confirmedStage, { acquiredRaw, swapResults: { ...swapResults }, transactionFeesSol: operation.transactionFeesSol });
+    }
+
+    const latestActive = await pool.getActiveBin();
+    const latestActiveBinId = Number(latestActive.binId);
+    const activeBinDrift = Math.abs(latestActiveBinId - active.binId);
+    if (!Number.isInteger(latestActiveBinId) || activeBinDrift > 0 || latestActiveBinId < minBinId || latestActiveBinId > maxBinId) {
+      throw new Error(`Active bin moved ${activeBinDrift} bins during swaps; position range is no longer safe`);
+    }
+
+    const tokenDecimals = async (mint) => mint === config.tokens.SOL ? 9 :
+      (await getConnection().getParsedAccountInfo(new PublicKey(mint), "confirmed")).value?.data?.parsed?.info?.decimals;
+    const decimalsX = await tokenDecimals(mintX);
+    const decimalsY = await tokenDecimals(mintY);
+    if (!Number.isInteger(decimalsX) || !Number.isInteger(decimalsY)) throw new Error("Could not verify token decimals after swaps");
+    const xLamports = mintX === config.tokens.SOL
+      ? new BN(Math.floor(plan.sides[0].budgetSol * 1e9)) : new BN(acquiredRaw.x);
+    const yLamports = mintY === config.tokens.SOL
+      ? new BN(Math.floor(plan.sides[1].budgetSol * 1e9)) : new BN(acquiredRaw.y);
+    if (xLamports.isZero() || yLamports.isZero()) throw new Error("Swap results did not produce positive liquidity on both sides");
+
+    const newPosition = Keypair.generate();
+    const transaction = await pool.initializePositionAndAddLiquidityByStrategy({
+      positionPubKey: newPosition.publicKey,
+      user: wallet.publicKey,
+      totalXAmount: xLamports,
+      totalYAmount: yLamports,
+      strategy: { minBinId, maxBinId, strategyType: rangeStrategy },
+      slippage: config.strategy.dualToken.maxSlippageBps / 100,
+    });
+    const { blockhash, lastValidBlockHeight } = await getConnection().getLatestBlockhash("confirmed");
+    transaction.feePayer = wallet.publicKey;
+    transaction.recentBlockhash = blockhash;
+    transaction.lastValidBlockHeight = lastValidBlockHeight;
+    transaction.partialSign(wallet, newPosition);
+    const rawTransaction = transaction.serialize();
+    const signature = bs58.encode(transaction.signature);
+    await dualOperationJournal.transition(operation.id, "position_pending", {
+      positionAddress: newPosition.publicKey.toString(),
+      positionSignature: signature,
+      positionTransaction: rawTransaction.toString("base64"),
+      lastValidBlockHeight,
+      acquiredRaw,
+      amountXRaw: xLamports.toString(),
+      amountYRaw: yLamports.toString(),
+      tokenDecimals: { x: decimalsX, y: decimalsY },
+    });
+    const sentSignature = await getConnection().sendRawTransaction(rawTransaction, { skipPreflight: false, maxRetries: 3 });
+    if (sentSignature !== signature) throw new Error("RPC returned a signature that differs from the journaled DLMM signature");
+    const confirmation = await getConnection().confirmTransaction({ signature, blockhash: transaction.recentBlockhash, lastValidBlockHeight }, "confirmed");
+    if (confirmation.value.err) throw new Error(`DLMM dual-token transaction failed: ${JSON.stringify(confirmation.value.err)}`);
+    const positionFeeSol = await getConfirmedTransactionFeeSol(signature);
+    await dualOperationJournal.recordTransaction(operation.id, { kind: "add_liquidity", signature, status: "confirmed", metadata: { feeSol: positionFeeSol } });
+    operation.transactionFeesSol = sumRecordedDualTransactionFees(await dualOperationJournal.get(operation.id));
+
+    trackPosition({
+      position: newPosition.publicKey.toString(), pool: poolAddress, pool_name: args.pool_name,
+      strategy: ta.strategy, bin_range: { min: minBinId, max: maxBinId, bins_below: ta.binsBelow, bins_above: ta.binsAbove },
+      amount_sol: requestedBudget, amount_x: Number(xLamports.toString()) / 10 ** decimalsX,
+      active_bin: active.binId, bin_step: binStep, volatility: args.volatility,
+      fee_tvl_ratio: args.fee_tvl_ratio, organic_score: args.organic_score, initial_value_usd: args.initial_value_usd,
+      entry_mcap: args.entry_mcap, entry_tvl: args.entry_tvl, entry_volume: args.entry_volume, entry_holders: args.entry_holders,
+      token_x_mint: mintX, token_y_mint: mintY, dual_token: true,
+      dual_deploy: {
+        amount_sol: requestedBudget, x_raw: xLamports.toString(), y_raw: yLamports.toString(),
+        x_decimals: decimalsX, y_decimals: decimalsY, swaps: { ...swapResults },
+        position_rent_estimate_sol: positionRentSol, ata_rent_budget_sol: temporaryAccountReserveSol, ta: ta.metrics,
+        transaction_fees_sol: operation.transactionFeesSol,
+        fee_accounting_complete: operation.transactionFeesSol != null,
+      },
+    });
+    await dualOperationJournal.transition(operation.id, "completed", { positionAddress: newPosition.publicKey.toString(), positionSignature: signature, transactionFeesSol: operation.transactionFeesSol, completedAt: new Date().toISOString() });
+    _positionsCacheAt = 0;
+    return {
+      success: true, dual_token: true, position: newPosition.publicKey.toString(), pool: poolAddress,
+      pool_name: args.pool_name, strategy: ta.strategy, bin_range: { min: minBinId, max: maxBinId, active: active.binId },
+      price_range: { min: minPrice, max: maxPrice }, amount_sol: requestedBudget,
+      token_x_mint: mintX, token_y_mint: mintY, amount_x: Number(xLamports.toString()) / 10 ** decimalsX,
+      amount_y: Number(yLamports.toString()) / 10 ** decimalsY,
+      txs: [...Object.values(swapResults).map((result) => result.tx).filter(Boolean), signature],
+      rent_estimate_sol: positionRentSol, reserve_sol: reserveSol, ta: ta.metrics,
+      transaction_fees_sol: operation.transactionFeesSol,
+    };
+  } catch (error) {
+    const latest = await dualOperationJournal.get(operation.id);
+    if (latest && !["completed", "cancelled"].includes(latest.stage)) {
+      let recoveryFailed = false;
+      if (!latest.positionSignature) {
+        for (const side of ["x", "y"]) {
+          const rawAmount = BigInt(acquiredRaw[side] || "0");
+          const mint = side === "x" ? mintX : mintY;
+          if (rawAmount <= 0n || mint === config.tokens.SOL) continue;
+          try {
+            const info = await getConnection().getParsedAccountInfo(new PublicKey(mint), "confirmed");
+            const decimals = info.value?.data?.parsed?.info?.decimals;
+            if (!Number.isInteger(decimals)) throw new Error(`Token decimals unavailable for ${mint}`);
+            const returned = await swapToken({
+              input_mint: mint,
+              output_mint: config.tokens.SOL,
+              amount_raw: rawAmount.toString(),
+              input_decimals: decimals,
+              onPrepared: async (prepared) => dualOperationJournal.recordTransaction(operation.id, {
+                kind: `rollback_${side}`,
+                signature: prepared.signature,
+                status: "signed",
+                metadata: prepared,
+              }),
+            });
+            if (!returned?.success) throw new Error(returned?.error || `Rollback swap failed for ${mint}`);
+            await dualOperationJournal.recordTransaction(operation.id, { kind: `rollback_${side}`, signature: returned.tx, status: "confirmed", metadata: returned });
+            acquiredRaw[side] = "0";
+            await dualOperationJournal.transition(operation.id, "recovery_pending", {
+              recoveryError: error.message,
+              recoveryResults: { ...(latest.recoveryResults || {}), [side]: returned },
+              acquiredRaw: { ...acquiredRaw },
+            });
+          } catch (recoveryError) {
+            recoveryFailed = true;
+            log("dual_recovery_error", `Operation ${operation.id} could not return ${mint.slice(0, 8)} to SOL: ${recoveryError.message}`);
+          }
+        }
+      } else {
+        recoveryFailed = true;
+      }
+      const afterRecovery = await dualOperationJournal.get(operation.id);
+      const unresolvedTx = (afterRecovery?.transactions || []).some((transaction) => transaction.status === "signed");
+      if (!recoveryFailed && !unresolvedTx && acquiredRaw.x === "0" && acquiredRaw.y === "0" && !afterRecovery?.positionSignature) {
+        await dualOperationJournal.transition(operation.id, "cancelled", { recoveryError: error.message, cancelledAt: new Date().toISOString() }).catch(() => {});
+      } else {
+        await dualOperationJournal.transition(operation.id, "recovery_pending", { recoveryError: error.message, acquiredRaw: { ...acquiredRaw } }).catch(() => {});
+      }
+    }
+    log("dual_deploy_error", `Operation ${operation.id} requires reconciliation: ${error.message}`);
+    return { success: false, recovery_pending: true, operation_id: operation.id, error: error.message };
+  }
+}
+
 function assertNoInitializeBinArrayInstructions(serializedTxs) {
   const offenders = [];
   for (const serialized of serializedTxs || []) {
@@ -474,6 +1237,12 @@ export async function deployPosition({
   entry_volume,
   entry_holders,
 }) {
+  if (config.strategy.dualToken.enabled) {
+    return deployDualTokenPosition({
+      pool_address, amount_sol, amount_x, amount_y, pool_name, volatility, fee_tvl_ratio,
+      organic_score, initial_value_usd, entry_mcap, entry_tvl, entry_volume, entry_holders,
+    });
+  }
   pool_address = normalizeMint(pool_address);
   const activeStrategy = strategy || config.strategy.strategy;
   let activeBinsBelow = bins_below ?? config.strategy.defaultBinsBelow ?? config.strategy.minBinsBelow;
@@ -960,6 +1729,11 @@ export async function getPositionPnl({ pool_address, position_address }) {
         return {
           pnl_usd: p.pnl_usd,
           pnl_pct: p.pnl_pct,
+          capital_pnl_sol: p.capital_pnl_sol,
+          capital_pnl_usd: p.capital_pnl_usd,
+          fee_income_sol: p.fee_income_sol,
+          fee_income_usd: p.fee_income_usd,
+          pnl_includes_capital_gain: p.pnl_includes_capital_gain,
           current_value_usd: p.total_value_usd,
           unclaimed_fee_usd: p.unclaimed_fees_usd,
           all_time_fees_usd: p.collected_fees_usd,
@@ -1163,6 +1937,7 @@ export async function getMyPositions({ force = false, silent = false, wallet_add
   }
 
   const loadPositions = async () => { try {
+    if (useLocalWallet) await reconcilePendingDualExits(getWallet());
     // ── Primary path: public infra (on-chain RPC + Jupiter + Meteora deposits) ──
     // No LPAgent / agentmeridian dependency, so the poller runs aggressively on
     // fully public resources. Falls through to the Meteora-API path on any error.
@@ -1231,12 +2006,34 @@ export async function getMyPositions({ force = false, silent = false, wallet_add
           : binData
             ? deriveOpenPnlPct(binData, config.management.solMode)
             : null;
-        const pnlPctDiff = reportedPnlPct != null && derivedPnlPct != null
+        const dualFeeIncomeSol = binData ?
+          safeNum(binData.unrealizedPnl?.unclaimedFeeTokenX?.amountSol) +
+          safeNum(binData.unrealizedPnl?.unclaimedFeeTokenY?.amountSol) +
+          safeNum(binData.allTimeFees?.total?.sol) : null;
+        let dualPnl = null;
+        if (tracked?.dual_token && tracked.dual_deploy?.amount_sol > 0 && binData
+          && tracked.dual_deploy?.transaction_fees_sol != null && tracked.dual_deploy?.fee_accounting_complete !== false) {
+          try {
+            dualPnl = computeDualPnl({
+              rawPnlSol: safeNum(binData.pnlSol),
+              depositsSol: safeNum(binData.allTimeDeposits?.total?.sol),
+              budgetSol: tracked.dual_deploy.amount_sol,
+              feeIncomeSol: dualFeeIncomeSol,
+              transactionFeesSol: tracked.dual_deploy.transaction_fees_sol ?? 0,
+              rentPaidSol: (tracked.dual_deploy.position_rent_estimate_sol ?? 0) + (tracked.dual_deploy.ata_rent_budget_sol ?? 0),
+              rentRecoveredSol: tracked.dual_deploy.position_rent_recovered_sol ?? 0,
+            });
+          } catch (error) {
+            log("pnl_warn", `Dual-token fallback accounting unavailable for ${positionAddress.slice(0, 8)}: ${error.message}`);
+          }
+        }
+        const effectivePnlPct = tracked?.dual_token ? dualPnl?.netPnlPct ?? null : derivedPnlPct ?? reportedPnlPct;
+        const pnlPctDiff = !tracked?.dual_token && reportedPnlPct != null && derivedPnlPct != null
           ? Math.abs(reportedPnlPct - derivedPnlPct)
           : null;
-        const pnlPctSuspicious = pnlPctDiff != null && pnlPctDiff > (config.management.pnlSanityMaxDiffPct ?? 5);
+        const pnlPctSuspicious = tracked?.dual_token ? !dualPnl : pnlPctDiff != null && pnlPctDiff > (config.management.pnlSanityMaxDiffPct ?? 5);
         if (pnlPctSuspicious) {
-          log("positions_warn", `Suspicious pnl_pct for ${positionAddress.slice(0, 8)}: reported=${reportedPnlPct.toFixed(2)} derived=${derivedPnlPct.toFixed(2)} diff=${pnlPctDiff.toFixed(2)}`);
+          log("positions_warn", `Suspicious pnl_pct for ${positionAddress.slice(0, 8)}: reported=${Number.isFinite(reportedPnlPct) ? reportedPnlPct.toFixed(2) : "unknown"} derived=${Number.isFinite(derivedPnlPct) ? derivedPnlPct.toFixed(2) : "unknown"} diff=${Number.isFinite(pnlPctDiff) ? pnlPctDiff.toFixed(2) : "unknown"}`);
         }
 
         positions.push({
@@ -1244,6 +2041,9 @@ export async function getMyPositions({ force = false, silent = false, wallet_add
           pool:               pool.poolAddress,
           pair:               tracked?.pool_name || `${pool.tokenX}/${pool.tokenY}`,
           base_mint:          pool.tokenXMint,
+          token_x_mint:       tracked?.token_x_mint || pool.tokenXMint,
+          token_y_mint:       tracked?.token_y_mint || pool.tokenYMint,
+          dual_token:         !!tracked?.dual_token,
           lower_bin:          lowerBin,
           upper_bin:          upperBin,
           active_bin:         activeBin,
@@ -1303,13 +2103,56 @@ export async function getMyPositions({ force = false, silent = false, wallet_add
             : binData
             ? Math.round(parseFloat(config.management.solMode ? (binData.pnlSol || 0) : (binData.pnlUsd || 0)) * 10000) / 10000
             : null,
+          pnl_sol_net: dualPnl?.netPnlSol ?? null,
+          capital_pnl_sol_net: dualPnl?.capitalPnlSol ?? null,
+          dual_transaction_fees_sol: dualPnl?.executionFeesSol ?? null,
+          dual_rent_paid_sol: dualPnl?.rentPaidSol ?? null,
+          dual_rent_recovered_sol: dualPnl?.rentRecoveredSol ?? null,
+          fee_income_sol: dualFeeIncomeSol,
+          pnl_includes_capital_gain: !!(lpData || binData),
           pnl_true_usd:       lpData
             ? Math.round(safeNum(lpData.pnl?.value) * 10000) / 10000
             : binData
             ? Math.round(parseFloat(binData.pnlUsd || 0) * 10000) / 10000
             : null,
-          pnl_pct:            (lpData || binData)
-            ? Math.round(reportedPnlPct * 100) / 100
+          raw_pnl_sol: binData ? safeNum(binData.pnlSol) : null,
+          deposits_sol: binData ? safeNum(binData.allTimeDeposits?.total?.sol) : null,
+          dual_fee_income_sol: binData ? Math.round((
+            safeNum(binData.unrealizedPnl?.unclaimedFeeTokenX?.amountSol) +
+            safeNum(binData.unrealizedPnl?.unclaimedFeeTokenY?.amountSol) +
+            safeNum(binData.allTimeFees?.total?.sol)
+          ) * 10000) / 10000 : null,
+          capital_pnl_sol: binData
+            ? Math.round((
+                safeNum(binData.unrealizedPnl?.balancesSol) +
+                safeNum(binData.allTimeWithdrawals?.total?.sol) -
+                safeNum(binData.allTimeDeposits?.total?.sol)
+              ) * 10000) / 10000
+            : null,
+          capital_pnl_usd: binData
+            ? Math.round((
+                safeNum(binData.unrealizedPnl?.balances) +
+                safeNum(binData.allTimeWithdrawals?.total?.usd) -
+                safeNum(binData.allTimeDeposits?.total?.usd)
+              ) * 10000) / 10000
+            : null,
+          fee_income_sol: binData
+            ? Math.round((
+                safeNum(binData.unrealizedPnl?.unclaimedFeeTokenX?.amountSol) +
+                safeNum(binData.unrealizedPnl?.unclaimedFeeTokenY?.amountSol) +
+                safeNum(binData.allTimeFees?.total?.sol)
+              ) * 10000) / 10000
+            : null,
+          fee_income_usd: binData
+            ? Math.round((
+                safeNum(binData.unrealizedPnl?.unclaimedFeeTokenX?.usd) +
+                safeNum(binData.unrealizedPnl?.unclaimedFeeTokenY?.usd) +
+                safeNum(binData.allTimeFees?.total?.usd)
+              ) * 10000) / 10000
+            : null,
+          pnl_includes_capital_gain: !!(lpData || binData),
+          pnl_pct:            effectivePnlPct != null
+            ? Math.round(effectivePnlPct * 100) / 100
             : null,
           pnl_pct_derived:    derivedPnlPct != null ? Math.round(derivedPnlPct * 100) / 100 : null,
           pnl_pct_diff:       pnlPctDiff != null ? Math.round(pnlPctDiff * 100) / 100 : null,
@@ -1506,10 +2349,103 @@ export async function closePosition({ position_address, reason }) {
     const wallet = getWallet();
     const poolAddress = await lookupPoolForPosition(position_address, wallet.publicKey.toString());
     const poolMeta = await getPoolMetadata(poolAddress);
-    if (shouldUseLpAgentRelay()) {
+    let pool = await getPool(poolAddress);
+    const positionAccountBefore = tracked?.dual_token
+      ? await getConnection().getAccountInfo(new PublicKey(position_address), "confirmed")
+      : null;
+    const dualMints = tracked?.dual_token
+      ? [pool.lbPair.tokenXMint.toString(), pool.lbPair.tokenYMint.toString()]
+      : [];
+    const dualBalancesBefore = {};
+    for (const mint of dualMints.filter((address) => address !== config.tokens.SOL)) {
+      dualBalancesBefore[mint] = await getMintBalanceRaw(wallet.publicKey, mint);
+    }
+    const withDualCloseAssets = async (result) => {
+      if (!tracked?.dual_token) return result;
+      const assets = [];
+      for (const mint of dualMints.filter((address) => address !== config.tokens.SOL)) {
+        const balanceAfter = BigInt(await getMintBalanceRaw(wallet.publicKey, mint));
+        const balanceBefore = BigInt(dualBalancesBefore[mint] || "0");
+        const amountRaw = balanceAfter > balanceBefore ? balanceAfter - balanceBefore : 0n;
+        if (amountRaw <= 0n) continue;
+        const mintInfo = await getConnection().getParsedAccountInfo(new PublicKey(mint), "confirmed");
+        const decimals = mintInfo.value?.data?.parsed?.info?.decimals;
+        if (!Number.isInteger(decimals)) throw new Error(`Could not read decimals for closed token ${mint}`);
+        assets.push({ mint, amount_raw: amountRaw.toString(), decimals });
+      }
+      const positionAccountAfter = await getConnection().getAccountInfo(new PublicKey(position_address), "confirmed");
+      const positionRentRecoveredSol = positionAccountBefore && !positionAccountAfter
+        ? positionAccountBefore.lamports / 1e9
+        : null;
+      let exitOperation = null;
+      if (assets.length) {
+        try {
+          exitOperation = await executeOrResumeDualExit({
+            positionAddress: position_address,
+            poolAddress,
+            wallet,
+            assets,
+            positionRentRecoveredSol,
+          });
+        } catch (error) {
+          exitOperation = { stage: "recovery_pending", error: error.message };
+          log("dual_exit_warn", `Position closed but token-to-SOL recovery needs retry: ${error.message}`);
+        }
+      }
+      let persistedExit = exitOperation?.operation_id
+        ? await dualOperationJournal.get(exitOperation.operation_id)
+        : exitOperation?.id ? await dualOperationJournal.get(exitOperation.id) : null;
+      if (!persistedExit && assets.length) {
+        persistedExit = (await dualOperationJournal.list({ includeTerminal: true }))
+          .find((operation) => operation.idempotencyKey === `dual-exit:${position_address}`) || null;
+      }
+      const remainingExitAssets = persistedExit
+        ? Object.values(persistedExit.assetsRemaining || {}).filter((asset) => BigInt(asset.amount_raw || "0") > 0n)
+        : assets;
+      const exitSwapFeesSol = persistedExit ? sumRecordedDualTransactionFees(persistedExit) : 0;
+      let dualPnl = null;
+      if (tracked?.dual_token && Number.isFinite(result.dual_raw_pnl_sol) && Number.isFinite(result.dual_deposits_sol)
+        && tracked.dual_deploy?.transaction_fees_sol != null && tracked.dual_deploy?.fee_accounting_complete !== false) {
+        let closeTransactionFeesSol = 0;
+        let closeFeeAccountingComplete = true;
+        for (const signature of result.txs || []) {
+          const feeSol = await getConfirmedTransactionFeeSol(signature);
+          if (feeSol == null) closeFeeAccountingComplete = false;
+          else closeTransactionFeesSol += feeSol;
+        }
+        if (persistedExit && sumRecordedDualTransactionFees(persistedExit) == null) closeFeeAccountingComplete = false;
+        dualPnl = computeDualPnl({
+          rawPnlSol: result.dual_raw_pnl_sol,
+          depositsSol: result.dual_deposits_sol,
+          budgetSol: tracked.dual_deploy.amount_sol,
+          feeIncomeSol: result.dual_fee_income_sol ?? 0,
+          transactionFeesSol: (tracked.dual_deploy.transaction_fees_sol ?? 0) + closeTransactionFeesSol + exitSwapFeesSol,
+          rentPaidSol: (tracked.dual_deploy.position_rent_estimate_sol ?? 0) + (tracked.dual_deploy.ata_rent_budget_sol ?? 0),
+          rentRecoveredSol: positionRentRecoveredSol ?? 0,
+        });
+        if (!closeFeeAccountingComplete) dualPnl = null;
+      }
+      return {
+        ...result,
+        dual_token: true,
+        auto_swap_assets: remainingExitAssets,
+        auto_swap_complete: persistedExit?.stage === "completed" || assets.length === 0,
+        auto_swap_note: assets.length === 0
+          ? "No non-SOL token balance was recovered from the pool."
+          : persistedExit?.stage === "completed"
+            ? `Both pool tokens converted to SOL; received ${(Number(BigInt(persistedExit.solReceivedLamports || "0")) / 1e9).toFixed(6)} SOL.`
+            : persistedExit
+              ? `Token-to-SOL conversion remains queued for automatic retry${exitOperation?.error ? `: ${exitOperation.error}` : "."}`
+              : `Could not persist automatic token-to-SOL recovery. Manual attention is required${exitOperation?.error ? `: ${exitOperation.error}` : "."}`,
+        exit_swap_txs: (persistedExit?.transactions || []).filter((transaction) => transaction.kind.startsWith("exit_swap:")).map((transaction) => transaction.signature),
+        position_rent_recovered_sol: positionRentRecoveredSol,
+        dual_pnl: dualPnl,
+        ...(dualPnl ? { pnl_sol: dualPnl.netPnlSol, pnl_pct: dualPnl.netPnlPct } : {}),
+      };
+    };
+    if (shouldUseLpAgentRelay() && !tracked?.dual_token) {
       let relaySubmitted = false;
       try {
-      const pool = await getPool(poolAddress);
       const relayAllowedDebitMints = [
         pool.lbPair.tokenXMint.toString(),
         pool.lbPair.tokenYMint.toString(),
@@ -1712,7 +2648,7 @@ export async function closePosition({ position_address, reason }) {
           },
         });
 
-        return {
+        return await withDualCloseAssets({
           success: true,
           relay: true,
           request_id: order.requestId,
@@ -1725,7 +2661,7 @@ export async function closePosition({ position_address, reason }) {
           pnl_usd: pnlUsd,
           pnl_pct: pnlPct,
           base_mint: closeBaseMint,
-        };
+        });
       }
 
       appendDecision({
@@ -1739,7 +2675,7 @@ export async function closePosition({ position_address, reason }) {
         metrics: {},
       });
 
-      return {
+      return await withDualCloseAssets({
         success: true,
         relay: true,
         request_id: order.requestId,
@@ -1750,7 +2686,7 @@ export async function closePosition({ position_address, reason }) {
         close_txs: closeTxHashes,
         txs: txHashes,
         base_mint: livePosition?.base_mint || null,
-      };
+      });
       } catch (relayError) {
         if (relaySubmitted) throw relayError;
         log("close_warn", `Relay zap-out failed before submit; falling back to local close + Jupiter autoswap: ${relayError.message}`);
@@ -1759,7 +2695,7 @@ export async function closePosition({ position_address, reason }) {
 
     // Clear cached pool so SDK loads fresh position fee state
     poolCache.delete(poolAddress.toString());
-    const pool = await getPool(poolAddress);
+    pool = await getPool(poolAddress);
 
     const positionPubKey = new PublicKey(position_address);
     const claimTxHashes = [];
@@ -1894,6 +2830,9 @@ export async function closePosition({ position_address, reason }) {
       let finalValueUsd = 0;
       let initialUsd = 0;
       let feesUsd = tracked.total_fees_claimed_usd || 0;
+      let dualRawPnlSol = null;
+      let dualDepositsSol = null;
+      let dualFeeIncomeSol = null;
       try {
         const closedUrl = `https://dlmm.datapi.meteora.ag/positions/${poolAddress}/pnl?user=${wallet.publicKey.toString()}&status=closed&pageSize=50&page=1`;
         for (let attempt = 0; attempt < 6; attempt++) {
@@ -1908,6 +2847,9 @@ export async function closePosition({ position_address, reason }) {
               const nextFinalValueUsd = parseFloat(posEntry.allTimeWithdrawals?.total?.usd || 0);
               const nextInitialUsd = parseFloat(posEntry.allTimeDeposits?.total?.usd || 0);
               const nextFeesUsd = parseFloat(posEntry.allTimeFees?.total?.usd || 0) || feesUsd;
+              dualRawPnlSol = maybeNum(posEntry.pnlSol);
+              dualDepositsSol = maybeNum(posEntry.allTimeDeposits?.total?.sol);
+              dualFeeIncomeSol = safeNum(posEntry.allTimeFees?.total?.sol);
 
               if (shouldRejectClosedPnl(nextPnlPct, reason || tracked?.close_reason)) {
                 log("close_warn", `Rejected unsettled closed PnL for ${position_address.slice(0, 8)} on attempt ${attempt + 1}/6: ${nextPnlPct.toFixed(2)}%`);
@@ -1934,6 +2876,9 @@ export async function closePosition({ position_address, reason }) {
       if (finalValueUsd === 0) {
         const cachedPos = _positionsCache?.positions?.find(p => p.position === position_address);
         if (cachedPos) {
+          dualRawPnlSol = maybeNum(cachedPos.raw_pnl_sol);
+          dualDepositsSol = maybeNum(cachedPos.deposits_sol);
+          dualFeeIncomeSol = maybeNum(cachedPos.dual_fee_income_sol);
           pnlTrueUsd    = cachedPos.pnl_true_usd ?? (config.management.solMode ? 0 : cachedPos.pnl_usd) ?? 0;
           pnlUsd        = config.management.solMode ? (cachedPos.pnl_usd ?? 0) : pnlTrueUsd;
           pnlPct        = cachedPos.pnl_pct   ?? 0;
@@ -2017,7 +2962,7 @@ export async function closePosition({ position_address, reason }) {
         },
       });
 
-      return {
+      return await withDualCloseAssets({
         success: true,
         position: position_address,
         pool: poolAddress,
@@ -2028,7 +2973,10 @@ export async function closePosition({ position_address, reason }) {
         pnl_usd: pnlUsd,
         pnl_pct: pnlPct,
         base_mint: closeBaseMint,
-      };
+        dual_raw_pnl_sol: dualRawPnlSol,
+        dual_deposits_sol: dualDepositsSol,
+        dual_fee_income_sol: dualFeeIncomeSol,
+      });
     }
 
     appendDecision({
@@ -2042,7 +2990,7 @@ export async function closePosition({ position_address, reason }) {
       metrics: {},
     });
 
-    return {
+    return await withDualCloseAssets({
       success: true,
       position: position_address,
       pool: poolAddress,
@@ -2051,7 +2999,7 @@ export async function closePosition({ position_address, reason }) {
       close_txs: closeTxHashes,
       txs: txHashes,
       base_mint: pool.lbPair.tokenXMint.toString(),
-    };
+    });
   } catch (error) {
     log("close_error", error.message);
     return { success: false, error: error.message };

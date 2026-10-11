@@ -1,6 +1,7 @@
 import { Connection, PublicKey } from "@solana/web3.js";
 import { config } from "../config.js";
 import { log } from "../logger.js";
+import { computeDualPnl } from "./dual-deploy.js";
 import {
   getTrackedPosition,
   markOutOfRange,
@@ -151,6 +152,7 @@ function mapEntries(map) {
 
 // ─── Build the shaped position object (matches getMyPositions output) ──
 function buildPosition(f, prices, solUsd, meteora, solMode) {
+  const tracked = getTrackedPosition(f.position);
   const priceX = f.baseMint ? (prices[f.baseMint] ?? 0) : 0;
 
   const xHuman = safeNum(f.xRaw) / 10 ** f.decX;
@@ -172,10 +174,32 @@ function buildPosition(f, prices, solUsd, meteora, solMode) {
 
   const pnlUsd = balancesUsd + withdrawUsd + claimableUsd + claimedUsd - depositsUsd;
   const pnlSol = balancesSol + withdrawSol + claimableSol + claimedSol - depositsSol;
+  const capitalPnlUsd = balancesUsd + withdrawUsd - depositsUsd;
+  const capitalPnlSol = balancesSol + withdrawSol - depositsSol;
+  const feeIncomeUsd = claimableUsd + claimedUsd;
+  const feeIncomeSol = claimableSol + claimedSol;
   const pctUsd = depositsUsd > 0 ? (pnlUsd / depositsUsd) * 100 : 0;
   const pctSol = depositsSol > 0 ? (pnlSol / depositsSol) * 100 : 0;
 
-  const ourPct = solMode ? pctSol : pctUsd;
+  let dualPnl = null;
+  const dualFeeAccountingAvailable = tracked?.dual_deploy?.transaction_fees_sol != null
+    && tracked?.dual_deploy?.fee_accounting_complete !== false;
+  if (tracked?.dual_token && tracked.dual_deploy?.amount_sol > 0 && depositsSol > 0 && dualFeeAccountingAvailable) {
+    try {
+      dualPnl = computeDualPnl({
+        rawPnlSol: pnlSol,
+        depositsSol,
+        budgetSol: tracked.dual_deploy.amount_sol,
+        feeIncomeSol,
+        transactionFeesSol: tracked.dual_deploy.transaction_fees_sol ?? 0,
+        rentPaidSol: (tracked.dual_deploy.position_rent_estimate_sol ?? 0) + (tracked.dual_deploy.ata_rent_budget_sol ?? 0),
+        rentRecoveredSol: tracked.dual_deploy.position_rent_recovered_sol ?? 0,
+      });
+    } catch (error) {
+      log("pnl_warn", `Dual-token cost accounting unavailable for ${f.position.slice(0, 8)}: ${error.message}`);
+    }
+  }
+  const ourPct = dualPnl ? dualPnl.netPnlPct : solMode ? pctSol : pctUsd;
 
   // pnl_pct_diff is the gap vs Meteora's precomputed pct — kept ONLY as a logged
   // diagnostic. It is NOT used to gate exits: Meteora's pct comes from the
@@ -183,7 +207,7 @@ function buildPosition(f, prices, solUsd, meteora, solMode) {
   // poll, so on a fast move the gap inflates and would falsely suppress
   // STOP_LOSS / TRAILING_TP exactly when they matter.
   const reportedPct = solMode ? maybeNum(meteora?.pnlSolPctChange) : maybeNum(meteora?.pnlPctChange);
-  const pnlPctDiff = reportedPct != null ? Math.abs(ourPct - reportedPct) : null;
+  const pnlPctDiff = !tracked?.dual_token && reportedPct != null ? Math.abs(ourPct - reportedPct) : null;
 
   // On-chain amounts are authoritative; a tick is "suspicious" (don't act on it)
   // only when we couldn't price it. Guards against:
@@ -191,7 +215,7 @@ function buildPosition(f, prices, solUsd, meteora, solMode) {
   //  - missing Meteora deposits → 0 cost basis → garbage pnl / inflated value
   const holdsTokenX = xHuman > 0 || feeXHuman > 0;
   const priceMissing = !(solUsd > 0) || (holdsTokenX && !!f.baseMint && !(priceX > 0));
-  const depositsMissing = (solMode ? depositsSol : depositsUsd) <= 0;
+  const depositsMissing = tracked?.dual_token ? !dualPnl : (solMode ? depositsSol : depositsUsd) <= 0;
   const pnlPctSuspicious = priceMissing || depositsMissing;
   if (pnlPctSuspicious) {
     log("pnl_warn", `${f.position.slice(0, 8)} suspicious tick — priceMissing=${priceMissing} depositsMissing=${depositsMissing} (solUsd=${solUsd}, priceX=${priceX})`);
@@ -204,7 +228,6 @@ function buildPosition(f, prices, solUsd, meteora, solMode) {
   if (inRange) markInRange(f.position);
   else markOutOfRange(f.position);
 
-  const tracked = getTrackedPosition(f.position);
   const ageFromState = tracked?.deployed_at
     ? Math.floor((Date.now() - new Date(tracked.deployed_at).getTime()) / 60000)
     : null;
@@ -227,6 +250,19 @@ function buildPosition(f, prices, solUsd, meteora, solMode) {
     collected_fees_true_usd: round(claimedUsd),
     pnl_usd:            round(solMode ? pnlSol : pnlUsd),
     pnl_true_usd:       round(pnlUsd),
+    pnl_sol_net:        dualPnl ? round(dualPnl.netPnlSol) : null,
+    raw_pnl_sol:        round(pnlSol),
+    deposits_sol:       round(depositsSol),
+    dual_fee_income_sol: round(feeIncomeSol),
+    capital_pnl_sol_net: dualPnl ? round(dualPnl.capitalPnlSol) : null,
+    dual_transaction_fees_sol: dualPnl ? round(dualPnl.executionFeesSol) : null,
+    dual_rent_paid_sol: dualPnl ? round(dualPnl.rentPaidSol) : null,
+    dual_rent_recovered_sol: dualPnl ? round(dualPnl.rentRecoveredSol) : null,
+    fee_income_sol:     round(feeIncomeSol),
+    fee_income_usd:     round(feeIncomeUsd),
+    pnl_includes_capital_gain: true,
+    capital_pnl_sol:    round(capitalPnlSol),
+    capital_pnl_usd:    round(capitalPnlUsd),
     pnl_pct:            round(ourPct, 2),
     pnl_pct_derived:    round(ourPct, 2),
     pnl_pct_diff:       pnlPctDiff != null ? round(pnlPctDiff, 2) : null,

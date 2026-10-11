@@ -9,7 +9,7 @@ import { getMyPositions, closePosition, getActiveBin } from "./tools/dlmm.js";
 import { getWalletBalances } from "./tools/wallet.js";
 import { discoverPools, getTopCandidates } from "./tools/screening.js";
 import { formatAllowlistedPoolDiagnostics, formatDryRunDeploy } from "./screening-report.js";
-import { getPoolAllowlistDisplay, getPoolRestrictionReason } from "./token-allowlist.js";
+import { getDualPoolRestrictionReason, getPoolAllowlistDisplay, getPoolRestrictionReason } from "./token-allowlist.js";
 import { DEFAULT_RESEARCH_DIR, enqueueResearchCandidates } from "./research/queue.js";
 import { startBackgroundResearchWorker } from "./research/worker.js";
 import { config, reloadScreeningThresholds, computeDeployAmount } from "./config.js";
@@ -491,7 +491,10 @@ export async function runScreeningCycle({ silent = false } = {}) {
     // Load active strategy
     const activeStrategy = getActiveStrategy();
     const deployStrategy = config.strategy.strategy;
-    const strategyBlock = `DEPLOY STRATEGY: ${deployStrategy} (from config) | bins_above: 0 (FIXED — never change) | deposit: SOL only (amount_y, amount_x=0)`
+    const strategyBlock = config.strategy.dualToken.enabled
+      ? `DEPLOY MODE: dual-token DLMM | budget: ${deployAmount} SOL | deterministic TA chooses Spot/Curve, range, and X/Y split; ignore model-supplied amounts and bins.`
+      : `DEPLOY STRATEGY: ${deployStrategy} (from config) | bins_above: 0 (FIXED — never change) | deposit: SOL only (amount_y, amount_x=0)`;
+    const strategyWithContext = strategyBlock
       + (activeStrategy ? `\nSTRATEGY CONTEXT: ${activeStrategy.name} — entry: ${activeStrategy.entry?.condition || "n/a"} | exit: ${activeStrategy.exit?.notes || "n/a"} | best for: ${activeStrategy.best_for}` : "");
 
     // Fetch top candidates, then recon each sequentially with a small delay to avoid 429s
@@ -562,6 +565,8 @@ export async function runScreeningCycle({ silent = false } = {}) {
           config.screening.tokenAllowlist,
           [...(topCandidates.filtered_details || []), ...filteredOut],
           candidates,
+          3000,
+          { dualToken: config.strategy.dualToken.enabled },
         ),
         ...(combinedExamples ? ["First three recorded rejects (token names may repeat):", combinedExamples] : []),
       ].join("\n");
@@ -631,6 +636,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
         pvpLine,
         `  smart_wallets: ${sw?.in_pool?.length ?? 0} present${sw?.in_pool?.length ? ` → CONFIDENCE BOOST (${sw.in_pool.map(w => w.name).join(", ")})` : ""}`,
         activeBin != null ? `  active_bin: ${activeBin}` : null,
+        pool.dual_ta ? `  dual_ta: ${pool.dual_ta.strategy} | bins ${pool.dual_ta.minBinId}→${pool.dual_ta.maxBinId} | 6h range ${pool.dual_ta.metrics.sixHour.rangePct.toFixed(2)}% | trend ${pool.dual_ta.metrics.sixHour.netChangePct.toFixed(2)}%` : null,
         priceChange != null ? `  1h: price${priceChange >= 0 ? "+" : ""}${priceChange}%, net_buyers=${netBuyers ?? "?"}` : null,
         n?.narrative ? `  narrative_untrusted: ${sanitizeUntrustedPromptText(n.narrative, 500)}` : `  narrative_untrusted: none`,
         mem ? `  memory_untrusted: ${sanitizeUntrustedPromptText(mem, 500)}` : null,
@@ -662,7 +668,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
     let simulatedDeploy = null;
     const { content } = await agentLoop(`
 SCREENING CYCLE
-${strategyBlock}
+${strategyWithContext}
 Positions: ${prePositions.total_positions}/${config.risk.maxPositions} | SOL: ${currentBalance.sol.toFixed(3)} | Deploy: ${deployAmount} SOL
 
 PRE-LOADED CANDIDATES (${passing.length} pools):
@@ -674,8 +680,9 @@ STEPS:
 3. Call deploy_position (active_bin is pre-fetched above — no need to call get_active_bin).
    bins_below = round(${config.strategy.minBinsBelow} + (candidate volatility/5)*(${config.strategy.maxBinsBelow - config.strategy.minBinsBelow})) clamped to [${config.strategy.minBinsBelow},${config.strategy.maxBinsBelow}].
    pass deploy_position.volatility = the candidate volatility value.
-   For single-side SOL deploys, do not invent upside:
-   set amount_y only, keep amount_x = 0, keep bins_above = 0, and let the upper bin stay at the active bin.
+   ${config.strategy.dualToken.enabled
+      ? "In dual-token mode, pass amount_sol as the full SOL budget. The deploy tool calculates fresh TA and exact token amounts; do not provide token amounts or executable range choices."
+      : "For single-side SOL deploys, do not invent upside: set amount_y only, keep amount_x = 0, keep bins_above = 0, and let the upper bin stay at the active bin."}
 4. Report in this exact format (no tables, no extra sections):
    🚀 DEPLOYED
 
@@ -931,7 +938,9 @@ process.on("SIGTERM", () => shutdown("SIGTERM"));
 //  FORMAT CANDIDATES TABLE
 // ═══════════════════════════════════════════
 function candidateRestriction(pool) {
-  return getPoolRestrictionReason(pool.base?.mint, pool.quote?.mint, config.screening.tokenAllowlist);
+  return config.strategy.dualToken.enabled
+    ? getDualPoolRestrictionReason(pool.base?.mint, pool.quote?.mint, config.screening.tokenAllowlist, config.strategy.dualToken.baseMints)
+    : getPoolRestrictionReason(pool.base?.mint, pool.quote?.mint, config.screening.tokenAllowlist);
 }
 
 function formatCandidates(candidates, filteredExamples = []) {
@@ -942,7 +951,9 @@ function formatCandidates(candidates, filteredExamples = []) {
   }
 
   const lines = candidates.map((p, i) => {
-    const status = getPoolAllowlistDisplay(p.base?.mint, p.quote?.mint, config.screening.tokenAllowlist).label;
+    const status = config.strategy.dualToken.enabled
+      ? candidateRestriction(p) ? "👀 OBSERVE · TOKEN ALLOWLIST REQUIRED" : "✅ ALLOWLIST · DUAL TOKEN"
+      : getPoolAllowlistDisplay(p.base?.mint, p.quote?.mint, config.screening.tokenAllowlist).label;
     const metrics = `fee/aTVL:${p.fee_active_tvl_ratio ?? "?"}  vol:$${p.volume_window ?? "?"}  TVL:$${p.tvl ?? "?"}  organic:${p.organic_score ?? "?"}`;
     return `  [${i + 1}] ${status} ${p.name || "unknown"} | ${metrics}\n      ${p.pool} | ${p.base?.symbol || "?"}/${p.quote?.symbol || "?"}`;
   });

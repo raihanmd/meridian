@@ -17,6 +17,23 @@
   "minBinsBelow": 35,
   "maxBinsBelow": 69,
   "defaultBinsBelow": 69,
+  "dualTokenEnabled": false,
+  "dualTokenBaseMints": [
+    "So11111111111111111111111111111111111111112",
+    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+  ],
+  "dualTokenMinSamples": 24,
+  "dualTokenMaxCandleAgeSeconds": 1800,
+  "dualTokenMaxGapSeconds": 900,
+  "dualTokenMinBinsPerSide": 5,
+  "dualTokenMinTotalBins": 35,
+  "dualTokenMaxTotalBins": 69,
+  "dualTokenVolatilityMultiplier": 1.25,
+  "dualTokenMaxDirectionalBias": 0.2,
+  "dualTokenCurveEfficiencyMax": 0.35,
+  "dualTokenMaxSlippageBps": 100,
+  "dualTokenMaxPriceImpactPct": 1,
+  "dualTokenMaxTransactionFeesSol": 0.03,
 
   "timeframe": "5m",
   "category": "trending",

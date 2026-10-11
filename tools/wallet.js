@@ -52,6 +52,74 @@ function getJupiterReferralParams() {
   return { referralAccount, referralFee: Math.round(referralFee) };
 }
 
+export async function quoteSolSwap({ output_mint, amount_sol }) {
+  output_mint = normalizeMint(output_mint);
+  const amount = Number(amount_sol);
+  if (!output_mint || output_mint === config.tokens.SOL || !Number.isFinite(amount) || amount <= 0) {
+    throw new Error("SOL swap quote needs a non-SOL output mint and positive SOL amount");
+  }
+  const wallet = getWallet();
+  const search = new URLSearchParams({
+    inputMint: config.tokens.SOL,
+    outputMint: output_mint,
+    amount: String(Math.floor(amount * 1e9)),
+    taker: wallet.publicKey.toString(),
+  });
+  if (config.strategy.dualToken.enabled) search.set("slippageBps", String(config.strategy.dualToken.maxSlippageBps));
+  const referral = getJupiterReferralParams();
+  if (referral) {
+    search.set("referralAccount", referral.referralAccount);
+    search.set("referralFee", String(referral.referralFee));
+  }
+  const key = getJupiterApiKey();
+  const response = await fetch(`${JUPITER_SWAP_V2_API}/order?${search}`, {
+    headers: key ? { "x-api-key": key } : {},
+    signal: AbortSignal.timeout(10_000),
+  });
+  if (!response.ok) throw new Error(`Jupiter route quote failed: ${response.status}`);
+  const order = await response.json();
+  if (order.errorCode || order.errorMessage || !order.transaction || !order.requestId) {
+    throw new Error(`No executable SOL route for ${output_mint}: ${order.errorMessage || order.errorCode || "missing transaction"}`);
+  }
+  if (!/^\d+$/.test(String(order.outAmount || "")) || BigInt(order.outAmount) <= 0n) {
+    throw new Error(`Jupiter returned an invalid output quote for ${output_mint}`);
+  }
+  return {
+    input_mint: config.tokens.SOL,
+    output_mint,
+    in_amount: String(order.inAmount),
+    out_amount: String(order.outAmount),
+    min_out_amount: String(order.otherAmountThreshold ?? order.outAmount),
+    fee_bps: order.feeBps ?? null,
+    fee_mint: order.feeMint ?? null,
+    price_impact_pct: Number(order.priceImpactPct ?? 0) * 100,
+    request_id: order.requestId,
+  };
+}
+
+export async function resumeJupiterSwap({ signedTransaction, requestId }) {
+  if (!signedTransaction || !requestId) throw new Error("Cannot resume Jupiter swap without the exact signed transaction and request ID");
+  const key = getJupiterApiKey();
+  const response = await fetch(`${JUPITER_SWAP_V2_API}/execute`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...(key ? { "x-api-key": key } : {}) },
+    body: JSON.stringify({ signedTransaction, requestId }),
+    signal: AbortSignal.timeout(20_000),
+  });
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok || result.status === "Failed") {
+    throw new Error(`Jupiter resumed swap failed: ${result.error || result.code || response.status}`);
+  }
+  if (!result.signature) throw new Error("Jupiter resumed swap returned no transaction signature");
+  return {
+    success: true,
+    tx: result.signature,
+    amount_in: result.inputAmountResult,
+    amount_out: result.outputAmountResult,
+    status: result.status,
+  };
+}
+
 /**
  * Get current wallet balances: SOL, USDC, and all SPL tokens using Helius Wallet API.
  * Returns USD-denominated values provided by Helius.
@@ -146,6 +214,12 @@ export async function swapToken({
   input_mint,
   output_mint,
   amount,
+  amount_raw,
+  input_decimals,
+  slippage_bps,
+  onPrepared,
+  onSubmitted,
+  onConfirmed,
 }) {
   input_mint  = normalizeMint(input_mint);
   output_mint = normalizeMint(output_mint);
@@ -153,7 +227,7 @@ export async function swapToken({
   if (process.env.DRY_RUN === "true") {
     return {
       dry_run: true,
-      would_swap: { input_mint, output_mint, amount },
+      would_swap: { input_mint, output_mint, amount, amount_raw },
       message: "DRY RUN — no transaction sent",
     };
   }
@@ -164,12 +238,17 @@ export async function swapToken({
     const connection = getConnection();
 
     // ─── Convert to smallest unit ──────────────────────────────
-    let decimals = 9; // SOL default
-    if (input_mint !== config.tokens.SOL) {
+    let decimals = Number.isInteger(input_decimals) ? input_decimals : 9; // SOL default
+    if (amount_raw == null && input_mint !== config.tokens.SOL) {
       const mintInfo = await connection.getParsedAccountInfo(new PublicKey(input_mint));
       decimals = mintInfo.value?.data?.parsed?.info?.decimals ?? 9;
     }
-    const amountStr = Math.floor(amount * Math.pow(10, decimals)).toString();
+    const amountStr = amount_raw == null
+      ? String(Math.floor(Number(amount) * Math.pow(10, decimals)))
+      : String(amount_raw);
+    if (!Number.isInteger(decimals) || decimals < 0 || decimals > 18 || !/^\d+$/.test(amountStr) || BigInt(amountStr) <= 0n) {
+      throw new Error("Swap input amount or token decimals are invalid");
+    }
 
     // ─── Get Swap V2 order (unsigned tx + requestId) ───────────
     const search = new URLSearchParams({
@@ -178,6 +257,10 @@ export async function swapToken({
       amount: amountStr,
       taker: wallet.publicKey.toString(),
     });
+    const requestedSlippageBps = Number.isInteger(slippage_bps)
+      ? slippage_bps
+      : config.strategy.dualToken.enabled ? config.strategy.dualToken.maxSlippageBps : null;
+    if (requestedSlippageBps != null) search.set("slippageBps", String(requestedSlippageBps));
     const referralParams = getJupiterReferralParams();
     if (referralParams) {
       search.set("referralAccount", referralParams.referralAccount);
@@ -205,6 +288,22 @@ export async function swapToken({
     const tx = VersionedTransaction.deserialize(Buffer.from(unsignedTx, "base64"));
     tx.sign([wallet]);
     const signedTx = Buffer.from(tx.serialize()).toString("base64");
+    const signature = bs58.encode(tx.signatures[0]);
+    await onPrepared?.({
+      signature,
+      signedTransaction: signedTx,
+      requestId,
+      lastValidBlockHeight: order.lastValidBlockHeight ?? null,
+      input_mint,
+      output_mint,
+      amount_in: order.inAmount ?? amountStr,
+      amount_out: order.outAmount ?? null,
+      min_amount_out: order.otherAmountThreshold ?? order.outAmount ?? null,
+      price_impact_pct: Number(order.priceImpactPct ?? 0),
+      fee_bps: order.feeBps ?? null,
+      fee_mint: order.feeMint ?? null,
+    });
+    await onSubmitted?.({ signature, requestId });
 
     // ─── Execute ───────────────────────────────────────────────
     const execRes = await fetch(`${JUPITER_SWAP_V2_API}/execute`, {
@@ -232,7 +331,7 @@ export async function swapToken({
       );
     }
 
-    return {
+    const confirmed = {
       success: true,
       tx: result.signature,
       input_mint,
@@ -244,6 +343,8 @@ export async function swapToken({
       fee_bps_applied: order.feeBps ?? null,
       fee_mint: order.feeMint ?? null,
     };
+    await onConfirmed?.({ ...confirmed, signature: result.signature });
+    return confirmed;
   } catch (error) {
     log("swap_error", error.message);
     return { success: false, error: error.message };

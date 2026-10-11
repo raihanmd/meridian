@@ -138,6 +138,22 @@ export const config = {
     minBinsBelow: strategyMinBinsBelow,
     maxBinsBelow: strategyMaxBinsBelow,
     defaultBinsBelow: strategyDefaultBinsBelow,
+    dualToken: {
+      enabled: u.dualTokenEnabled ?? false,
+      baseMints: u.dualTokenBaseMints ?? ["So11111111111111111111111111111111111111112", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"],
+      minSamples: u.dualTokenMinSamples ?? 24,
+      maxCandleAgeSeconds: u.dualTokenMaxCandleAgeSeconds ?? 1800,
+      maxGapSeconds: u.dualTokenMaxGapSeconds ?? 900,
+      minBinsPerSide: u.dualTokenMinBinsPerSide ?? 5,
+      minTotalBins: u.dualTokenMinTotalBins ?? 35,
+      maxTotalBins: u.dualTokenMaxTotalBins ?? 69,
+      volatilityMultiplier: u.dualTokenVolatilityMultiplier ?? 1.25,
+      maxDirectionalBias: u.dualTokenMaxDirectionalBias ?? 0.2,
+      curveEfficiencyMax: u.dualTokenCurveEfficiencyMax ?? 0.35,
+      maxSlippageBps: u.dualTokenMaxSlippageBps ?? 100,
+      maxPriceImpactPct: u.dualTokenMaxPriceImpactPct ?? 1,
+      maxTransactionFeesSol: u.dualTokenMaxTransactionFeesSol ?? 0.03,
+    },
   },
 
   // ─── Scheduling ─────────────────────────
@@ -305,5 +321,20 @@ export function reloadScreeningThresholds() {
       config.strategy.minBinsBelow,
       Math.min(config.strategy.maxBinsBelow, Math.round(defaultBinsBelow)),
     );
+    const dual = config.strategy.dualToken;
+    dual.enabled = fresh.dualTokenEnabled ?? dual.enabled;
+    if (Array.isArray(fresh.dualTokenBaseMints)) dual.baseMints = fresh.dualTokenBaseMints;
+    for (const [configKey, targetKey] of [
+      ["dualTokenMinSamples", "minSamples"], ["dualTokenMaxCandleAgeSeconds", "maxCandleAgeSeconds"],
+      ["dualTokenMaxGapSeconds", "maxGapSeconds"], ["dualTokenMinBinsPerSide", "minBinsPerSide"],
+      ["dualTokenMinTotalBins", "minTotalBins"], ["dualTokenMaxTotalBins", "maxTotalBins"],
+      ["dualTokenVolatilityMultiplier", "volatilityMultiplier"], ["dualTokenMaxDirectionalBias", "maxDirectionalBias"],
+      ["dualTokenCurveEfficiencyMax", "curveEfficiencyMax"],
+      ["dualTokenMaxSlippageBps", "maxSlippageBps"], ["dualTokenMaxPriceImpactPct", "maxPriceImpactPct"],
+      ["dualTokenMaxTransactionFeesSol", "maxTransactionFeesSol"],
+    ]) {
+      const value = numericConfig(fresh[configKey]);
+      if (value != null) dual[targetKey] = value;
+    }
   } catch { /* ignore */ }
 }

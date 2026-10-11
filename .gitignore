@@ -18,6 +18,8 @@ gmgn-config.json
 
 # Runtime state (position tracking, lessons — user-specific)
 state.json
+dual-operations.json
+dual-operations.json.*.lock
 lessons.json
 smart-wallets.json
 pool-memory.json
@@ -39,6 +41,9 @@ context.md
 CONTEXT.md
 dev-blocklist.json
 docs/
+!docs/
+!docs/designs/
+!docs/designs/**
 
 # Discord listener queue
 discord-signals.json

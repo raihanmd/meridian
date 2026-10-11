@@ -5,7 +5,8 @@ import { log } from "../logger.js";
 import { isBaseMintOnCooldown, isPoolOnCooldown } from "../pool-memory.js";
 import { confirmIndicatorPreset } from "./chart-indicators.js";
 import { getAgentMeridianBase, getAgentMeridianHeaders } from "./agent-meridian.js";
-import { getPoolRestrictionReason } from "../token-allowlist.js";
+import { getDualPoolRestrictionReason, getPoolRestrictionReason } from "../token-allowlist.js";
+import { analyzeDualTokenRange, fetchDualTokenOhlcv } from "./dual-ta.js";
 
 const DATAPI_JUP = "https://datapi.jup.ag/v1";
 
@@ -550,17 +551,21 @@ export async function getTopCandidates({ limit = 10, discovery: providedDiscover
   const filteredOut = Array.isArray(discovery.filtered_examples) ? [...discovery.filtered_examples] : [];
 
   // Exclude pools where the wallet already has an open position
-  const { getMyPositions } = await import("./dlmm.js");
+  const { getMyPositions, getActiveBin } = await import("./dlmm.js");
   const { positions } = await getMyPositions();
   const occupiedPools = new Set(positions.map((p) => p.pool));
-  const occupiedMints = new Set(positions.map((p) => p.base_mint).filter(Boolean));
+  const occupiedMints = new Set(positions.flatMap((p) => config.strategy.dualToken.enabled
+    ? [p.base_mint, p.token_x_mint, p.token_y_mint].filter(Boolean)
+    : [p.base_mint].filter(Boolean)));
   const minTvl = Number(config.screening.minTvl ?? 0);
   const maxTvl = config.screening.maxTvl == null ? null : Number(config.screening.maxTvl);
   const minFeeActiveTvlRatio = Number(config.screening.minFeeActiveTvlRatio ?? 0);
 
   const eligible = pools
     .filter((p) => {
-      const restriction = getPoolRestrictionReason(p.base?.mint, p.quote?.mint, config.screening.tokenAllowlist);
+      const restriction = config.strategy.dualToken.enabled
+        ? getDualPoolRestrictionReason(p.base?.mint, p.quote?.mint, config.screening.tokenAllowlist, config.strategy.dualToken.baseMints)
+        : getPoolRestrictionReason(p.base?.mint, p.quote?.mint, config.screening.tokenAllowlist);
       if (restriction) {
         pushFilteredReason(filteredOut, p, restriction);
         return false;
@@ -587,7 +592,7 @@ export async function getTopCandidates({ limit = 10, discovery: providedDiscover
         pushFilteredReason(filteredOut, p, "already have an open position in this pool");
         return false;
       }
-      if (occupiedMints.has(p.base?.mint)) {
+      if ([p.base?.mint, ...(config.strategy.dualToken.enabled ? [p.quote?.mint] : [])].some((mint) => occupiedMints.has(mint))) {
         pushFilteredReason(filteredOut, p, "already holding this base token in another pool");
         return false;
       }
@@ -605,6 +610,36 @@ export async function getTopCandidates({ limit = 10, discovery: providedDiscover
     })
     .sort((a, b) => scoreCandidate(b) - scoreCandidate(a))
     .slice(0, limit);
+
+  if (config.strategy.dualToken.enabled && eligible.length > 0) {
+    const decisions = await Promise.all(eligible.map(async (pool) => {
+      try {
+        const [ohlcv, active] = await Promise.all([
+          fetchDualTokenOhlcv(pool.pool),
+          getActiveBin({ pool_address: pool.pool }),
+        ]);
+        const analysis = analyzeDualTokenRange({
+          candles: ohlcv.candles,
+          activeBin: active.binId,
+          binStep: Number(pool.bin_step),
+          ...config.strategy.dualToken,
+        });
+        return { pool, analysis };
+      } catch (error) {
+        return { pool, analysis: { eligible: false, reason: `TA preflight unavailable: ${error.message}` } };
+      }
+    }));
+    const eligibleByTa = [];
+    for (const { pool, analysis } of decisions) {
+      if (!analysis.eligible) {
+        pushFilteredReason(filteredOut, pool, `dual-token TA rejected candidate: ${analysis.reason}`);
+        continue;
+      }
+      pool.dual_ta = analysis;
+      eligibleByTa.push(pool);
+    }
+    eligible.splice(0, eligible.length, ...eligibleByTa);
+  }
 
   if (config.screening.avoidPvpSymbols && eligible.length > 0) {
     await enrichPvpRisk(eligible);
