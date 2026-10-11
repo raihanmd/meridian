@@ -60,5 +60,6 @@ Add an optional autonomous dual-token deployment mode to Meridian's existing Met
 - Do not enable the mode by default. Rollout starts with config disabled and dry-run output verified before any live deployment.
 - The current path only accepts standard SPL Token mints and refuses ranges that need non-refundable bin-array initialization rent.
 - If any confirmed transaction fee cannot be read from RPC, dual PnL is marked unavailable and manager actions are suppressed until accounting is complete.
+- The RPC PnL engine must price token X and token Y by their actual mints. For a STRK-USDC pool, USDC uses its own USD price; the SOL/USD price is only the denominator for SOL accounting. A missing price for either held token makes PnL unavailable and blocks PnL-based exits.
 - Exit retries persist exact signed Jupiter intents. When Jupiter cannot return the exact output amount for a confirmed historical swap, the RPC balance-delta fallback is recorded with its provenance because it can include recoverable account lamports.
 - No live wallet transaction has been exercised as part of implementation verification; test suites use pure calculations, journal files, and mocked/pure policy checks.
