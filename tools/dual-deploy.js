@@ -50,6 +50,21 @@ export function validateSwapOutcome({ expectedInputLamports, actualInputLamports
   return { unusedInputLamports: (expectedInput - actualInput).toString(), outputLamports: output.toString() };
 }
 
+export function validatePreparedDualSwapQuote({ expectedInput, preparedInput, minOutput, priceImpactPct, maxPriceImpactPct }) {
+  if (!/^\d+$/.test(String(expectedInput)) || !/^\d+$/.test(String(preparedInput)) || BigInt(expectedInput) <= 0n || BigInt(preparedInput) !== BigInt(expectedInput)) {
+    throw new Error("Jupiter order input differs from the planned SOL allocation");
+  }
+  if (!/^\d+$/.test(String(minOutput)) || BigInt(minOutput) <= 0n) {
+    throw new Error("Jupiter order has no valid minimum output");
+  }
+  const impact = Number(priceImpactPct);
+  const limit = Number(maxPriceImpactPct);
+  if (!Number.isFinite(impact) || impact < 0 || !Number.isFinite(limit) || limit < 0 || impact > limit) {
+    throw new Error(`Jupiter price impact ${impact}% exceeds the configured ${limit}% limit`);
+  }
+  return { minOutput: String(minOutput) };
+}
+
 /**
  * Return the exact net token delta for one owner and mint in a confirmed
  * transaction. This is transaction scoped: wallet balances that existed

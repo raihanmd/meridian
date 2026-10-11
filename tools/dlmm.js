@@ -42,6 +42,7 @@ import {
   computeDualValueSplit,
   getConfirmedOwnerMintDelta,
   hasUnresolvedSwapTransactions,
+  validatePreparedDualSwapQuote,
   validateSwapOutcome,
 } from "./dual-deploy.js";
 import { dualOperationJournal } from "./dual-operations.js";
@@ -421,6 +422,8 @@ async function recordJupiterExecutionResponse(operationId, transaction, response
     executionCode: response?.code ?? null,
     executionInputRaw: response?.inputAmountResult ?? null,
     executionOutputRaw: response?.outputAmountResult ?? null,
+    executionTotalInputRaw: response?.totalInputAmount ?? null,
+    executionTotalOutputRaw: response?.totalOutputAmount ?? null,
     executionReportedAt: new Date().toISOString(),
   };
   if (!signature) {
@@ -708,9 +711,17 @@ async function reconcileDualOperation(operation, pool, wallet) {
       const returned = await swapToken({
         input_mint: mint,
         output_mint: config.tokens.SOL,
+        require_self_paid: true,
         amount_raw: amountRaw.toString(),
         input_decimals: decimals,
         onPrepared: async (prepared) => {
+          validatePreparedDualSwapQuote({
+            expectedInput: amountRaw.toString(),
+            preparedInput: prepared.amount_in,
+            minOutput: prepared.min_amount_out,
+            priceImpactPct: prepared.price_impact_pct,
+            maxPriceImpactPct: config.strategy.dualToken.maxPriceImpactPct,
+          });
           operation.rollbackSignatures ??= {};
           operation.rollbackSignatures[side] = prepared.signature;
           await dualOperationJournal.recordTransaction(operation.id, {
@@ -870,12 +881,19 @@ async function executeOrResumeDualExit({ positionAddress, poolAddress, wallet, a
       const result = await swapToken({
         input_mint: asset.mint,
         output_mint: config.tokens.SOL,
+        require_self_paid: true,
         amount_raw: asset.amount_raw,
         input_decimals: asset.decimals,
         slippage_bps: config.strategy.dualToken.maxSlippageBps,
         onPrepared: async (quote) => {
           prepared = quote;
-          if (quote.price_impact_pct > config.strategy.dualToken.maxPriceImpactPct) throw new Error(`Exit swap impact ${quote.price_impact_pct.toFixed(3)}% exceeds the configured limit`);
+          validatePreparedDualSwapQuote({
+            expectedInput: asset.amount_raw,
+            preparedInput: quote.amount_in,
+            minOutput: quote.min_amount_out,
+            priceImpactPct: quote.price_impact_pct,
+            maxPriceImpactPct: config.strategy.dualToken.maxPriceImpactPct,
+          });
           await dualOperationJournal.recordTransaction(operation.id, {
             kind: `exit_swap:${asset.mint}`,
             signature: quote.signature,
@@ -1008,9 +1026,13 @@ async function deployDualTokenPositionLocked(args) {
   const quotes = {};
   for (const swap of plan.swaps) {
     const quote = await quoteSolSwap({ output_mint: swap.outputMint, amount_sol: swap.inputSol });
-    if (quote.price_impact_pct > config.strategy.dualToken.maxPriceImpactPct) {
-      throw new Error(`Jupiter price impact ${quote.price_impact_pct.toFixed(3)}% for ${swap.outputMint.slice(0, 8)} exceeds ${config.strategy.dualToken.maxPriceImpactPct}%`);
-    }
+    validatePreparedDualSwapQuote({
+      expectedInput: String(Math.floor(swap.inputSol * 1e9)),
+      preparedInput: quote.in_amount,
+      minOutput: quote.min_out_amount,
+      priceImpactPct: quote.price_impact_pct,
+      maxPriceImpactPct: config.strategy.dualToken.maxPriceImpactPct,
+    });
     quotes[swap.side] = quote;
   }
 
@@ -1075,16 +1097,22 @@ async function deployDualTokenPositionLocked(args) {
         currentSwapSide: swap.side,
       });
       let preparedSignature = null;
+      let preparedMinimumOutput = null;
       const result = await swapToken({
         input_mint: config.tokens.SOL,
         output_mint: swap.outputMint,
+        require_self_paid: true,
         amount: swap.inputSol,
         onPrepared: async (prepared) => {
           preparedSignature = prepared.signature;
-          const expectedMin = BigInt(quote.min_out_amount);
-          const currentMin = BigInt(prepared.min_amount_out || prepared.amount_out || "0");
-          if (prepared.price_impact_pct > config.strategy.dualToken.maxPriceImpactPct) throw new Error("Updated Jupiter quote exceeds the configured price-impact limit");
-          if (currentMin < expectedMin) throw new Error("Jupiter quote worsened beyond the original preflight minimum");
+          const validated = validatePreparedDualSwapQuote({
+            expectedInput: quote.in_amount,
+            preparedInput: prepared.amount_in,
+            minOutput: prepared.min_amount_out,
+            priceImpactPct: prepared.price_impact_pct,
+            maxPriceImpactPct: config.strategy.dualToken.maxPriceImpactPct,
+          });
+          preparedMinimumOutput = validated.minOutput;
           await dualOperationJournal.recordTransaction(operation.id, {
             kind: `swap_${swap.side}`,
             signature: prepared.signature,
@@ -1131,7 +1159,7 @@ async function deployDualTokenPositionLocked(args) {
       const outcome = validateSwapOutcome({
         expectedInputLamports: quote.in_amount,
         actualInputLamports: result.amount_in,
-        minOutput: quote.min_out_amount,
+        minOutput: preparedMinimumOutput,
         actualOutput: outputDeltaRaw,
       });
       if (result.amount_out != null && BigInt(result.amount_out) !== BigInt(outputDeltaRaw)) {

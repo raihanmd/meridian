@@ -8,6 +8,7 @@ import {
   confirmedTransactionHasSigner,
   getConfirmedOwnerMintDelta,
   hasUnresolvedSwapTransactions,
+  validatePreparedDualSwapQuote,
   validateSwapOutcome,
 } from "../tools/dual-deploy.js";
 
@@ -50,6 +51,30 @@ test("fails closed for reserves, missing routes, malformed splits, and unsafe sw
   assert.throws(() => validateSwapOutcome({ expectedInputLamports: "10", actualInputLamports: "11", minOutput: "1", actualOutput: "1" }), /spent more/);
   assert.throws(() => validateSwapOutcome({ expectedInputLamports: "10", actualInputLamports: "10", minOutput: "2", actualOutput: "1" }), /below its quote minimum/);
   assert.deepEqual(validateSwapOutcome({ expectedInputLamports: "10", actualInputLamports: "8", minOutput: "1", actualOutput: "2" }), { unusedInputLamports: "2", outputLamports: "2" });
+});
+
+test("uses the signed Jupiter order's minimum when its quote changed after preflight", () => {
+  const current = validatePreparedDualSwapQuote({
+    expectedInput: "500000000", preparedInput: "500000000", minOutput: "1499999",
+    priceImpactPct: 0.4, maxPriceImpactPct: 1,
+  });
+  assert.equal(current.minOutput, "1499999");
+  assert.deepEqual(validateSwapOutcome({
+    expectedInputLamports: "500000000", actualInputLamports: "500000000",
+    minOutput: current.minOutput, actualOutput: "1499999",
+  }), { unusedInputLamports: "0", outputLamports: "1499999" });
+  assert.throws(() => validateSwapOutcome({
+    expectedInputLamports: "500000000", actualInputLamports: "500000000",
+    minOutput: current.minOutput, actualOutput: "1499998",
+  }), /below its quote minimum/);
+});
+
+test("rejects changed input, invalid minimum, and excessive or unknown price impact", () => {
+  const base = { expectedInput: "500000000", preparedInput: "500000000", minOutput: "1499999", priceImpactPct: 0.4, maxPriceImpactPct: 1 };
+  assert.throws(() => validatePreparedDualSwapQuote({ ...base, preparedInput: "500000001" }), /differs from the planned/);
+  assert.throws(() => validatePreparedDualSwapQuote({ ...base, minOutput: "0" }), /valid minimum/);
+  assert.throws(() => validatePreparedDualSwapQuote({ ...base, priceImpactPct: 1.01 }), /price impact/);
+  assert.throws(() => validatePreparedDualSwapQuote({ ...base, priceImpactPct: Number.NaN }), /price impact/);
 });
 
 test("separates capital movement, LP fees, execution fees, and unrecovered rent", () => {

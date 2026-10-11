@@ -10,6 +10,8 @@ Dual-token deployment converts a SOL budget into both DLMM pool tokens, then add
 - `dual-signature-mismatch` waits for every candidate signature to become terminal before retrying or rolling back.
 - `dual-inventory-preservation` never counts pre-existing wallet balance as this operation's output.
 - `dual-recovery-report` distinguishes completed rollback from pending/manual reconciliation in Telegram.
+- `dual-quote-refresh` accepts a changed order only when its exact SOL input, signed minimum output, and price impact satisfy the configured limits. The signed order's minimum governs the confirmed output check.
+- `dual-self-paid-route` rejects sponsored orders before signing, because their first transaction signature can be a placeholder until Jupiter executes them.
 
 ## How to get to it (user POV)
 
@@ -27,6 +29,7 @@ Preconditions:
 
 - **Test wallet-inventory accounting.** Run `node --test test/dual-deploy.test.js`. The test models a pre-existing 15.385906 USDC balance and confirms that a STRK transaction delta is attributed only to STRK; unchanged USDC delta is zero.
 - **Test interrupted execution.** The same suite verifies partial second-side failure, signature mismatch candidates, exact acquisition/rollback ledger, missing evidence, and rollback overspend rejection.
+- **Test changed Jupiter quotes.** The dual-deploy suite checks a refreshed order against its own minimum and price-impact cap. Run `node --test test/jupiter-wallet-amounts.test.js` to check wallet settlement amounts when Jupiter route amounts differ because of fees.
 - **Test durable recovery state.** Run `node --test test/dual-operations.test.js`. It verifies wallet-wide operation serialization and atomic persistence of confirmed transaction evidence with the owned-token ledger.
 - **Test Telegram report.** Run the screening report suite from Doctor and inspect that `DEPLOY RECOVERY` differentiates recovered from pending state. This validates formatting logic, not delivery to a live Telegram chat.
 - **Live recovery proof.** Only in the isolated environment, capture both signatures, confirmed transaction deltas, position/rent state, and the final report. Verify existing token inventory before and after. If the signature or owner/mint delta cannot be verified, Meridian must remain pending; do not mark it recovered.

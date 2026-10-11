@@ -14,7 +14,7 @@ Meridian has no local web server. Its user surfaces are the one-shot Node CLI, a
 For the isolated CLI proof, launch the app through its CLI entry point with a temporary home directory so its generated `~/.meridian/SKILL.md` cannot touch the operator's home:
 
 ```bash
-scripts/verify-cli-help.sh
+.agents/skills/verify-meridian/scripts/verify-cli-help.sh
 ```
 
 The helper exits after the command. It removes only the temporary home it created. Evidence remains under `/tmp/meridian-verification/`.
@@ -38,7 +38,7 @@ Require Node 18+, the expected repo root, successful syntax checks, passing focu
 
 ## Drive
 
-Use `scripts/verify-cli-help.sh` as the no-network, no-wallet CLI entry proof. Use `node cli.js candidates --limit 3` only when API access is configured and a read-only discovery call is acceptable. For Telegram, use `/status`, `/config`, `/candidates`, and `/screen` only on the operator's authorized bot; `/screen` refreshes the deterministic candidate list in Telegram.
+Use `.agents/skills/verify-meridian/scripts/verify-cli-help.sh` as the no-network, no-wallet CLI entry proof. Use `node cli.js candidates --limit 3` only when API access is configured and a read-only discovery call is acceptable. For Telegram, use `/status`, `/config`, `/candidates`, and `/screen` only on the operator's authorized bot; `/screen` refreshes the deterministic candidate list in Telegram.
 
 Never use `/deploy`, `node cli.js deploy`, `node cli.js swap`, `/close`, or `node cli.js close` for verification. They can sign real transactions when live mode is active.
 
@@ -62,7 +62,7 @@ If you started a development bot, stop that exact terminal process with Ctrl-C. 
 
 ## Helpers
 
-- `scripts/verify-cli-help.sh` runs the isolated CLI proof and checks the captured output and generated user help file. Invoke it from the repository root.
+- `.agents/skills/verify-meridian/scripts/verify-cli-help.sh` runs the isolated CLI proof and checks the captured output and generated user help file. Invoke it from the repository root.
 - The recovery suite is `node --test test/dual-deploy.test.js test/dual-operations.test.js`. It covers wallet inventory preservation, partial swaps, mismatched signatures, exact deltas, rollback limits, missing evidence, and durable journal updates.
 
 ## Feature map

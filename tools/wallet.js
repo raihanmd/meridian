@@ -52,6 +52,27 @@ function getJupiterReferralParams() {
   return { referralAccount, referralFee: Math.round(referralFee) };
 }
 
+export function jupiterWalletSettlementAmounts(result) {
+  return {
+    amount_in: result?.totalInputAmount ?? result?.inputAmountResult ?? null,
+    amount_out: result?.totalOutputAmount ?? result?.outputAmountResult ?? null,
+    route_amount_in: result?.inputAmountResult ?? null,
+    route_amount_out: result?.outputAmountResult ?? null,
+  };
+}
+
+export function jupiterPriceImpactPercent(order) {
+  if (order?.priceImpact != null) return Math.abs(Number(order.priceImpact));
+  if (order?.priceImpactPct != null) return Math.abs(Number(order.priceImpactPct) * 100);
+  return Number.NaN;
+}
+
+export function assertSelfPaidJupiterOrder({ order, taker, firstSigner }) {
+  if (!taker || order?.signatureFeePayer !== taker || firstSigner !== taker || order?.gasless === true) {
+    throw new Error("Jupiter order requires an external fee payer; dual-token swaps need the wallet as first signer for durable recovery");
+  }
+}
+
 export async function quoteSolSwap({ output_mint, amount_sol }) {
   output_mint = normalizeMint(output_mint);
   const amount = Number(amount_sol);
@@ -64,6 +85,7 @@ export async function quoteSolSwap({ output_mint, amount_sol }) {
     outputMint: output_mint,
     amount: String(Math.floor(amount * 1e9)),
     taker: wallet.publicKey.toString(),
+    excludeRouters: "jupiterz",
   });
   if (config.strategy.dualToken.enabled) search.set("slippageBps", String(config.strategy.dualToken.maxSlippageBps));
   const referral = getJupiterReferralParams();
@@ -84,6 +106,12 @@ export async function quoteSolSwap({ output_mint, amount_sol }) {
   if (!/^\d+$/.test(String(order.outAmount || "")) || BigInt(order.outAmount) <= 0n) {
     throw new Error(`Jupiter returned an invalid output quote for ${output_mint}`);
   }
+  const quotedTransaction = VersionedTransaction.deserialize(Buffer.from(order.transaction, "base64"));
+  assertSelfPaidJupiterOrder({
+    order,
+    taker: wallet.publicKey.toString(),
+    firstSigner: quotedTransaction.message.staticAccountKeys[0]?.toString(),
+  });
   return {
     input_mint: config.tokens.SOL,
     output_mint,
@@ -92,7 +120,7 @@ export async function quoteSolSwap({ output_mint, amount_sol }) {
     min_out_amount: String(order.otherAmountThreshold ?? order.outAmount),
     fee_bps: order.feeBps ?? null,
     fee_mint: order.feeMint ?? null,
-    price_impact_pct: Number(order.priceImpactPct ?? 0) * 100,
+    price_impact_pct: jupiterPriceImpactPercent(order),
     request_id: order.requestId,
   };
 }
@@ -113,6 +141,8 @@ export async function resumeJupiterSwap({ signedTransaction, requestId, onExecut
     code: result.code ?? null,
     inputAmountResult: result.inputAmountResult ?? null,
     outputAmountResult: result.outputAmountResult ?? null,
+    totalInputAmount: result.totalInputAmount ?? null,
+    totalOutputAmount: result.totalOutputAmount ?? null,
     requestId,
   });
   if (!response.ok || result.status === "Failed") {
@@ -122,8 +152,7 @@ export async function resumeJupiterSwap({ signedTransaction, requestId, onExecut
   return {
     success: true,
     tx: result.signature,
-    amount_in: result.inputAmountResult,
-    amount_out: result.outputAmountResult,
+    ...jupiterWalletSettlementAmounts(result),
     status: result.status,
   };
 }
@@ -225,6 +254,7 @@ export async function swapToken({
   amount_raw,
   input_decimals,
   slippage_bps,
+  require_self_paid = false,
   onPrepared,
   onSubmitted,
   onExecutionReported,
@@ -270,6 +300,7 @@ export async function swapToken({
       ? slippage_bps
       : config.strategy.dualToken.enabled ? config.strategy.dualToken.maxSlippageBps : null;
     if (requestedSlippageBps != null) search.set("slippageBps", String(requestedSlippageBps));
+    if (require_self_paid) search.set("excludeRouters", "jupiterz");
     const referralParams = getJupiterReferralParams();
     if (referralParams) {
       search.set("referralAccount", referralParams.referralAccount);
@@ -295,6 +326,11 @@ export async function swapToken({
 
     // ─── Deserialize and sign ─────────────────────────────────
     const tx = VersionedTransaction.deserialize(Buffer.from(unsignedTx, "base64"));
+    if (require_self_paid) assertSelfPaidJupiterOrder({
+      order,
+      taker: wallet.publicKey.toString(),
+      firstSigner: tx.message.staticAccountKeys[0]?.toString(),
+    });
     tx.sign([wallet]);
     const signedTx = Buffer.from(tx.serialize()).toString("base64");
     const signature = bs58.encode(tx.signatures[0]);
@@ -308,7 +344,7 @@ export async function swapToken({
       amount_in: order.inAmount ?? amountStr,
       amount_out: order.outAmount ?? null,
       min_amount_out: order.otherAmountThreshold ?? order.outAmount ?? null,
-      price_impact_pct: Number(order.priceImpactPct ?? 0),
+      price_impact_pct: jupiterPriceImpactPercent(order),
       fee_bps: order.feeBps ?? null,
       fee_mint: order.feeMint ?? null,
     });
@@ -334,6 +370,8 @@ export async function swapToken({
       code: result.code ?? null,
       inputAmountResult: result.inputAmountResult ?? null,
       outputAmountResult: result.outputAmountResult ?? null,
+      totalInputAmount: result.totalInputAmount ?? null,
+      totalOutputAmount: result.totalOutputAmount ?? null,
       requestId,
     });
     if (result.status === "Failed") {
@@ -353,8 +391,7 @@ export async function swapToken({
       tx: result.signature,
       input_mint,
       output_mint,
-      amount_in: result.inputAmountResult,
-      amount_out: result.outputAmountResult,
+      ...jupiterWalletSettlementAmounts(result),
       referral_account: referralParams?.referralAccount || null,
       referral_fee_bps_requested: referralParams?.referralFee || 0,
       fee_bps_applied: order.feeBps ?? null,
