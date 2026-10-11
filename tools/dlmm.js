@@ -21,6 +21,7 @@ import {
   recordClaim,
   recordClose,
   getTrackedPosition,
+  getTrackedPositions,
   minutesOutOfRange,
   syncOpenPositions,
 } from "../state.js";
@@ -30,7 +31,8 @@ import { normalizeMint, quoteSolSwap, resumeJupiterSwap, swapToken } from "./wal
 import { appendDecision } from "../decision-log.js";
 import { agentMeridianJson, getAgentIdForRequests, getAgentMeridianHeaders } from "./agent-meridian.js";
 import { getAndClearStagedSignals } from "../signal-tracker.js";
-import { computePositions, fetchDlmmPnlForPool } from "./pnl.js";
+import { computePositions, fetchDlmmPnlForPool, getSolUsdPrice } from "./pnl.js";
+import { verifyMissingPositions } from "./position-discovery.js";
 import { getDualPoolRestrictionReason, getPoolRestrictionReason } from "../token-allowlist.js";
 import { analyzeDualTokenRange, fetchDualTokenOhlcv } from "./dual-ta.js";
 import {
@@ -464,6 +466,21 @@ function sumRecordedDualTransactionFees(operation) {
   return confirmed.reduce((total, transaction) => total + Number(transaction.metadata.feeSol), 0);
 }
 
+async function readPositionRentSol(positionAddress) {
+  const account = await getConnection().getAccountInfo(new PublicKey(positionAddress), "confirmed").catch(() => null);
+  return account?.lamports != null ? account.lamports / 1e9 : null;
+}
+
+async function syncVerifiedOpenPositions(activeAddresses) {
+  const { confirmedMissing, unresolved } = await verifyMissingPositions(
+    activeAddresses,
+    getTrackedPositions(true),
+    (address) => getConnection().getAccountInfo(new PublicKey(address), "confirmed"),
+  );
+  if (unresolved.length) throw new Error(`Position discovery incomplete for ${unresolved.map((address) => address.slice(0, 8)).join(", ")}; on-chain presence is unresolved`);
+  syncOpenPositions(activeAddresses, confirmedMissing);
+}
+
 async function signedTransactionStillValid(signedTransaction) {
   try {
     const bytes = Buffer.from(signedTransaction, "base64");
@@ -492,6 +509,7 @@ async function finalizeDualPosition(operation, pool, wallet) {
   }
   const recordedFees = sumRecordedDualTransactionFees(operation);
   const transactionFeesSol = recordedFees === null ? null : recordedFees ?? operation.transactionFeesSol ?? null;
+  const positionRentPaidSol = await readPositionRentSol(operation.positionAddress);
   trackPosition({
     position: operation.positionAddress, pool: operation.poolAddress, pool_name: plan.pool_name,
     strategy: plan.strategy,
@@ -505,12 +523,16 @@ async function finalizeDualPosition(operation, pool, wallet) {
     dual_deploy: {
       amount_sol: plan.amount_sol, x_raw: String(xRaw), y_raw: String(yRaw), x_decimals: decimalsX, y_decimals: decimalsY,
       swaps: operation.swapResults || {}, position_rent_estimate_sol: operation.positionRentSol,
+      position_rent_paid_sol: positionRentPaidSol,
       ata_rent_budget_sol: plan.ata_rent_budget_sol, ta: plan.ta.metrics,
       transaction_fees_sol: transactionFeesSol,
       fee_accounting_complete: transactionFeesSol != null,
     },
   });
-  await dualOperationJournal.transition(operation.id, "completed", { completedAt: new Date().toISOString() });
+  await dualOperationJournal.transition(operation.id, "completed", {
+    completedAt: new Date().toISOString(),
+    ...(operation.recoveryError ? { reconciledError: operation.recoveryError, recoveryError: null } : {}),
+  });
   _positionsCacheAt = 0;
   return {
     success: true, dual_token: true, position: operation.positionAddress, pool: operation.poolAddress,
@@ -1222,6 +1244,7 @@ async function deployDualTokenPositionLocked(args) {
     const positionFeeSol = await getConfirmedTransactionFeeSol(signature);
     await dualOperationJournal.recordTransaction(operation.id, { kind: "add_liquidity", signature, status: "confirmed", metadata: { feeSol: positionFeeSol } });
     operation.transactionFeesSol = sumRecordedDualTransactionFees(await dualOperationJournal.get(operation.id));
+    const positionRentPaidSol = await readPositionRentSol(newPosition.publicKey.toString());
 
     trackPosition({
       position: newPosition.publicKey.toString(), pool: poolAddress, pool_name: args.pool_name,
@@ -1235,6 +1258,7 @@ async function deployDualTokenPositionLocked(args) {
         amount_sol: requestedBudget, x_raw: xLamports.toString(), y_raw: yLamports.toString(),
         x_decimals: decimalsX, y_decimals: decimalsY, swaps: { ...swapResults },
         position_rent_estimate_sol: positionRentSol, ata_rent_budget_sol: temporaryAccountReserveSol, ta: ta.metrics,
+        position_rent_paid_sol: positionRentPaidSol,
         transaction_fees_sol: operation.transactionFeesSol,
         fee_accounting_complete: operation.transactionFeesSol != null,
       },
@@ -1263,6 +1287,10 @@ async function deployDualTokenPositionLocked(args) {
         log("dual_recovery_error", `Operation ${operation.id} reconciliation failed: ${recoveryError.message}`);
         return null;
       });
+      if (recoveryResult?.success) {
+        log("dual_deploy_reconciled", `Operation ${operation.id} completed on-chain after the original submission reported an error`);
+        return recoveryResult;
+      }
       if (recoveryResult?.recovery_pending) {
         log("dual_recovery_pending", `Operation ${operation.id} awaits reconciliation: ${recoveryResult.error || error.message}`);
       } else if (recoveryResult?.recovered) {
@@ -2118,7 +2146,7 @@ export async function getMyPositions({ force = false, silent = false, wallet_add
         if (!silent) log("positions", `Computing PnL from RPC (${new URL(config.pnl.rpcUrl).host})...`);
         const rpcResult = await computePositions(walletAddress);
         if (useLocalWallet) {
-          syncOpenPositions(rpcResult.positions.map((p) => p.position));
+          await syncVerifiedOpenPositions(rpcResult.positions.map((p) => p.position));
           _positionsCache = rpcResult;
           _positionsCacheAt = Date.now();
         }
@@ -2143,6 +2171,8 @@ export async function getMyPositions({ force = false, silent = false, wallet_add
     // Needed for rules 3 & 4 (active_bin vs upper_bin comparison)
     const binDataByPool = {};
     const pnlMaps = await Promise.all(pools.map(pool => fetchDlmmPnlForPool(pool.poolAddress, walletAddress)));
+    const fallbackSolUsd = pools.some((pool) => (pool.listPositions || []).some((address) => getTrackedPosition(address)?.dual_token))
+      ? await getSolUsdPrice() : null;
     pools.forEach((pool, i) => { binDataByPool[pool.poolAddress] = pnlMaps[i]; });
     const lpAgentByPosition = {}; // LPAgent removed — Meteora binData only
 
@@ -2183,8 +2213,11 @@ export async function getMyPositions({ force = false, silent = false, wallet_add
           safeNum(binData.unrealizedPnl?.unclaimedFeeTokenY?.amountSol) +
           safeNum(binData.allTimeFees?.total?.sol) : null;
         let dualPnl = null;
+        const positionRentSol = tracked?.dual_token ? await readPositionRentSol(positionAddress) : null;
         if (tracked?.dual_token && tracked.dual_deploy?.amount_sol > 0 && binData
-          && tracked.dual_deploy?.transaction_fees_sol != null && tracked.dual_deploy?.fee_accounting_complete !== false) {
+          && maybeNum(binData.pnlSol) != null && maybeNum(binData.allTimeDeposits?.total?.sol) > 0
+          && tracked.dual_deploy?.transaction_fees_sol != null && tracked.dual_deploy?.fee_accounting_complete !== false
+          && positionRentSol != null) {
           try {
             dualPnl = computeDualPnl({
               rawPnlSol: safeNum(binData.pnlSol),
@@ -2192,8 +2225,8 @@ export async function getMyPositions({ force = false, silent = false, wallet_add
               budgetSol: tracked.dual_deploy.amount_sol,
               feeIncomeSol: dualFeeIncomeSol,
               transactionFeesSol: tracked.dual_deploy.transaction_fees_sol ?? 0,
-              rentPaidSol: (tracked.dual_deploy.position_rent_estimate_sol ?? 0) + (tracked.dual_deploy.ata_rent_budget_sol ?? 0),
-              rentRecoveredSol: tracked.dual_deploy.position_rent_recovered_sol ?? 0,
+              rentPaidSol: tracked.dual_deploy.position_rent_paid_sol ?? positionRentSol,
+              rentRecoveredSol: positionRentSol,
             });
           } catch (error) {
             log("pnl_warn", `Dual-token fallback accounting unavailable for ${positionAddress.slice(0, 8)}: ${error.message}`);
@@ -2266,7 +2299,9 @@ export async function getMyPositions({ force = false, silent = false, wallet_add
             : binData
             ? Math.round(parseFloat(binData.allTimeFees?.total?.usd || 0) * 10000) / 10000
             : null,
-          pnl_usd:            lpData
+          pnl_usd:            tracked?.dual_token
+            ? (dualPnl ? (config.management.solMode ? dualPnl.netPnlSol : fallbackSolUsd == null ? null : Math.round(dualPnl.netPnlSol * fallbackSolUsd * 10000) / 10000) : null)
+            : lpData
             ? Math.round((
                 config.management.solMode
                   ? safeNum(lpData.pnl?.valueNative)
@@ -2282,7 +2317,9 @@ export async function getMyPositions({ force = false, silent = false, wallet_add
           dual_rent_recovered_sol: dualPnl?.rentRecoveredSol ?? null,
           fee_income_sol: dualFeeIncomeSol,
           pnl_includes_capital_gain: !!(lpData || binData),
-          pnl_true_usd:       lpData
+          pnl_true_usd:       tracked?.dual_token
+            ? (dualPnl && fallbackSolUsd != null ? Math.round(dualPnl.netPnlSol * fallbackSolUsd * 10000) / 10000 : null)
+            : lpData
             ? Math.round(safeNum(lpData.pnl?.value) * 10000) / 10000
             : binData
             ? Math.round(parseFloat(binData.pnlUsd || 0) * 10000) / 10000
@@ -2351,7 +2388,7 @@ export async function getMyPositions({ force = false, silent = false, wallet_add
       source: "meteora",
     };
     if (useLocalWallet) {
-      syncOpenPositions(positions.map(p => p.position));
+      await syncVerifiedOpenPositions(positions.map(p => p.position));
       _positionsCache = result;
       _positionsCacheAt = Date.now();
     }
@@ -2576,7 +2613,10 @@ export async function closePosition({ position_address, reason }) {
         : assets;
       const exitSwapFeesSol = persistedExit ? sumRecordedDualTransactionFees(persistedExit) : 0;
       let dualPnl = null;
+      const rentPaidSol = tracked?.dual_deploy?.position_rent_paid_sol
+        ?? (positionAccountBefore?.lamports != null ? positionAccountBefore.lamports / 1e9 : null);
       if (tracked?.dual_token && Number.isFinite(result.dual_raw_pnl_sol) && Number.isFinite(result.dual_deposits_sol)
+        && result.dual_deposits_sol > 0
         && tracked.dual_deploy?.transaction_fees_sol != null && tracked.dual_deploy?.fee_accounting_complete !== false) {
         let closeTransactionFeesSol = 0;
         let closeFeeAccountingComplete = true;
@@ -2586,16 +2626,15 @@ export async function closePosition({ position_address, reason }) {
           else closeTransactionFeesSol += feeSol;
         }
         if (persistedExit && sumRecordedDualTransactionFees(persistedExit) == null) closeFeeAccountingComplete = false;
-        dualPnl = computeDualPnl({
+        if (closeFeeAccountingComplete && rentPaidSol != null && positionRentRecoveredSol != null) dualPnl = computeDualPnl({
           rawPnlSol: result.dual_raw_pnl_sol,
           depositsSol: result.dual_deposits_sol,
           budgetSol: tracked.dual_deploy.amount_sol,
           feeIncomeSol: result.dual_fee_income_sol ?? 0,
           transactionFeesSol: (tracked.dual_deploy.transaction_fees_sol ?? 0) + closeTransactionFeesSol + exitSwapFeesSol,
-          rentPaidSol: (tracked.dual_deploy.position_rent_estimate_sol ?? 0) + (tracked.dual_deploy.ata_rent_budget_sol ?? 0),
-          rentRecoveredSol: positionRentRecoveredSol ?? 0,
+          rentPaidSol,
+          rentRecoveredSol: positionRentRecoveredSol,
         });
-        if (!closeFeeAccountingComplete) dualPnl = null;
       }
       return {
         ...result,

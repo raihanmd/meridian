@@ -32,3 +32,4 @@ This map records Meridian's user-facing CLI and Telegram paths. Read it before d
 - [Pool candidate observation](./candidate-observation.md) uses read-only discovery and Telegram candidate refresh.
 - [Screening and dry-run deployment](./screening-dry-run.md) describes network and local side effects and prohibits live deployment.
 - [Dual-token deploy recovery](./dual-token-recovery.md) covers the partial-swap, signature mismatch, and pre-existing token balance safety contract.
+- [Position value and management](./position-accounting.md) covers cost-basis gating, actual rent, on-chain position discovery, and dual-token exit accounting.

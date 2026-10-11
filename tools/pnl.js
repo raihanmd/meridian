@@ -100,6 +100,11 @@ async function getJupiterPrices(mints) {
   }
 }
 
+export async function getSolUsdPrice() {
+  const prices = await getJupiterPrices([config.tokens.SOL]);
+  return prices[config.tokens.SOL] ?? null;
+}
+
 // ─── Deposit-history cache (sig-invalidated + TTL) ──────────────
 // Deposits/withdrawals/claimed fees change only on a position tx; feePerTvl24h
 // is a slow 24h pool stat. Cache per pool, refetch when any position's latest
@@ -161,7 +166,7 @@ export function valuePoolTokens({ xRaw, yRaw, decX, decY, priceX, priceY, solUsd
 }
 
 // ─── Build the shaped position object (matches getMyPositions output) ──
-function buildPosition(f, prices, solUsd, meteora, solMode) {
+function buildPosition(f, prices, solUsd, meteora, solMode, positionRentSol) {
   const tracked = getTrackedPosition(f.position);
   const priceX = f.baseMint ? prices[f.baseMint] : null;
   const priceY = f.quoteMint ? prices[f.quoteMint] : null;
@@ -196,7 +201,9 @@ function buildPosition(f, prices, solUsd, meteora, solMode) {
   let dualPnl = null;
   const dualFeeAccountingAvailable = tracked?.dual_deploy?.transaction_fees_sol != null
     && tracked?.dual_deploy?.fee_accounting_complete !== false;
-  if (!priceMissing && tracked?.dual_token && tracked.dual_deploy?.amount_sol > 0 && depositsSol > 0 && dualFeeAccountingAvailable) {
+  const rentPaidSol = tracked?.dual_deploy?.position_rent_paid_sol ?? positionRentSol;
+  if (!priceMissing && tracked?.dual_token && tracked.dual_deploy?.amount_sol > 0 && depositsSol > 0
+    && dualFeeAccountingAvailable && positionRentSol != null && rentPaidSol != null) {
     try {
       dualPnl = computeDualPnl({
         rawPnlSol: pnlSol,
@@ -204,14 +211,15 @@ function buildPosition(f, prices, solUsd, meteora, solMode) {
         budgetSol: tracked.dual_deploy.amount_sol,
         feeIncomeSol,
         transactionFeesSol: tracked.dual_deploy.transaction_fees_sol ?? 0,
-        rentPaidSol: (tracked.dual_deploy.position_rent_estimate_sol ?? 0) + (tracked.dual_deploy.ata_rent_budget_sol ?? 0),
-        rentRecoveredSol: tracked.dual_deploy.position_rent_recovered_sol ?? 0,
+        rentPaidSol,
+        rentRecoveredSol: positionRentSol,
       });
     } catch (error) {
       log("pnl_warn", `Dual-token cost accounting unavailable for ${f.position.slice(0, 8)}: ${error.message}`);
     }
   }
-  const ourPct = priceMissing ? null : dualPnl ? dualPnl.netPnlPct : solMode ? pctSol : pctUsd;
+  const ourPct = tracked?.dual_token ? dualPnl?.netPnlPct ?? null : priceMissing ? null : solMode ? pctSol : pctUsd;
+  const netPnlUsd = dualPnl && solUsd > 0 ? dualPnl.netPnlSol * solUsd : null;
 
   // pnl_pct_diff is the gap vs Meteora's precomputed pct — kept ONLY as a logged
   // diagnostic. It is NOT used to gate exits: Meteora's pct comes from the
@@ -259,8 +267,8 @@ function buildPosition(f, prices, solUsd, meteora, solMode) {
     total_value_true_usd: round(balancesUsd),
     collected_fees_usd: round(solMode ? claimedSol : claimedUsd),
     collected_fees_true_usd: round(claimedUsd),
-    pnl_usd:            round(solMode ? pnlSol : pnlUsd),
-    pnl_true_usd:       round(pnlUsd),
+    pnl_usd:            tracked?.dual_token ? (solMode ? dualPnl?.netPnlSol ?? null : netPnlUsd == null ? null : round(netPnlUsd)) : round(solMode ? pnlSol : pnlUsd),
+    pnl_true_usd:       tracked?.dual_token ? (netPnlUsd == null ? null : round(netPnlUsd)) : round(pnlUsd),
     pnl_sol_net:        dualPnl ? round(dualPnl.netPnlSol) : null,
     raw_pnl_sol:        round(pnlSol),
     deposits_sol:       round(depositsSol),
@@ -332,13 +340,17 @@ export async function computePositions(walletAddress) {
     return { wallet: walletAddress, total_positions: 0, positions: [], source: "rpc" };
   }
 
-  const [prices, meteoraByPosition] = await Promise.all([
+  const [prices, meteoraByPosition, rentByPosition] = await Promise.all([
     getJupiterPrices([SOL_MINT, ...flat.flatMap((f) => [f.baseMint, f.quoteMint])]),
     getMeteoraData(conn, walletAddress, flat),
+    Promise.all(flat.map(async (f) => {
+      const account = await conn.getAccountInfo(new PublicKey(f.position), "confirmed").catch(() => null);
+      return [f.position, account?.lamports != null ? account.lamports / 1e9 : null];
+    })).then((entries) => new Map(entries)),
   ]);
   const solUsd = prices[SOL_MINT] ?? null;
 
-  const positions = flat.map((f) => buildPosition(f, prices, solUsd, meteoraByPosition[f.position], solMode));
+  const positions = flat.map((f) => buildPosition(f, prices, solUsd, meteoraByPosition[f.position], solMode, rentByPosition.get(f.position)));
 
   return { wallet: walletAddress, total_positions: positions.length, positions, source: "rpc" };
 }

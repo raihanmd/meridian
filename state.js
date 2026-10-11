@@ -393,7 +393,8 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
   if (!pos || pos.closed) return null;
 
   if (pos.confirmed_trailing_exit_until) {
-    if (new Date(pos.confirmed_trailing_exit_until).getTime() > Date.now() && pos.confirmed_trailing_exit_reason) {
+    if (!pnl_pct_suspicious && currentPnlPct != null
+      && new Date(pos.confirmed_trailing_exit_until).getTime() > Date.now() && pos.confirmed_trailing_exit_reason) {
       const reason = pos.confirmed_trailing_exit_reason;
       pos.confirmed_trailing_exit_reason = null;
       pos.confirmed_trailing_exit_until = null;
@@ -435,7 +436,7 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
   }
 
   // ── Trailing TP ────────────────────────────────────────────────
-  if (!pnl_pct_suspicious && pos.trailing_active) {
+  if (!pnl_pct_suspicious && currentPnlPct != null && pos.trailing_active) {
     const dropFromPeak = pos.peak_pnl_pct - currentPnlPct;
     if (dropFromPeak >= mgmtConfig.trailingDropPct) {
       return {
@@ -499,18 +500,20 @@ export function setLastBriefingDate() {
 
 /**
  * Reconcile local state with actual on-chain positions.
- * Marks any local open positions as closed if they are not in the on-chain list.
+ * Marks a missing position closed only after a direct account lookup confirms
+ * the position account no longer exists.
  */
 const SYNC_GRACE_MS = 5 * 60_000; // don't auto-close positions deployed < 5 min ago
 
-export function syncOpenPositions(active_addresses) {
+export function syncOpenPositions(active_addresses, confirmedMissingAddresses = []) {
   const state = load();
   const activeSet = new Set(active_addresses);
+  const confirmedMissing = new Set(confirmedMissingAddresses);
   let changed = false;
 
   for (const posId in state.positions) {
     const pos = state.positions[posId];
-    if (pos.closed || activeSet.has(posId)) continue;
+    if (pos.closed || activeSet.has(posId) || !confirmedMissing.has(posId)) continue;
 
     // Grace period: newly deployed positions may not be indexed yet
     const deployedAt = pos.deployed_at ? new Date(pos.deployed_at).getTime() : 0;

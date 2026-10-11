@@ -552,7 +552,9 @@ export async function getTopCandidates({ limit = 10, discovery: providedDiscover
 
   // Exclude pools where the wallet already has an open position
   const { getMyPositions, getActiveBin } = await import("./dlmm.js");
-  const { positions } = await getMyPositions();
+  const positionResult = await getMyPositions();
+  if (positionResult.error) throw new Error(`Cannot verify open positions: ${positionResult.error}`);
+  const { positions } = positionResult;
   const occupiedPools = new Set(positions.map((p) => p.pool));
   const occupiedMints = new Set(positions.flatMap((p) => config.strategy.dualToken.enabled
     ? [p.base_mint, p.token_x_mint, p.token_y_mint].filter(Boolean)

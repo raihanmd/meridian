@@ -19,11 +19,11 @@ The screening cycle selects a candidate and may call the deploy tool. In dry-run
 Preconditions:
 
 - Explicitly accept external RPC, Meteora, Jupiter quote, discovery, and model API calls.
-- Confirm `DRY_RUN=true` in the process environment before running; do not rely only on a report label.
+- Use `DRY_RUN=true node cli.js screen --dry-run --silent` so the process environment explicitly confirms dry-run mode. The CLI `--dry-run` flag also sets this value before loading the bot.
 - Use an isolated checkout and disposable runtime state if the cycle could write decision or research records.
 - Do not run when an existing live bot is already polling the same Telegram bot token.
 
-- **Run a dry-run cycle.** Run `node cli.js screen --dry-run --silent`. The JSON response has `done: true` and a report containing either `DRY RUN · WOULD DEPLOY` with a simulated plan or `NO DEPLOY` with rejection reasons.
+- **Run a dry-run cycle.** Run `DRY_RUN=true node cli.js screen --dry-run --silent`. The JSON response has `done: true`. A successful plan says `DRY RUN · WOULD DEPLOY` for single-sided mode or `DRY RUN · DUAL-TOKEN DEPLOY` for dual mode. The cycle may instead report `NO DEPLOY`, a precheck skip, or an observer failure; record which path actually ran.
 - **Verify skipped writes.** Confirm the deploy result is marked `dry_run`, no deployment transaction signature exists, no new dual-operation journal record was created, and the wallet's on-chain state is unchanged. Do not infer these facts from the phrase “dry run.”
 - **Proof.** Preserve command output, process environment evidence showing `DRY_RUN=true` without recording secrets, and before/after operation journal and wallet/position state.
 

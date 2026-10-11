@@ -1,6 +1,6 @@
 # Pool candidate observation
 
-Candidate observation refreshes pool data and displays which pools pass configured discovery filters. It is a read path; allowlist and deployment readiness are separate decisions.
+Candidate observation refreshes pool data and displays which pools pass configured discovery filters. It sends no transactions; Telegram and interactive CLI refreshes can update the local research candidate queue. Allowlist and deployment readiness are separate decisions.
 
 ## Sub-features
 
@@ -20,7 +20,7 @@ Preconditions:
 
 - Doctor passes.
 - Meteora discovery access is reachable. CLI enrichment may also call RPC and token data APIs.
-- For Telegram, this is the operator's existing authorized bot and there is no competing poller.
+- For Telegram, this is the operator's existing authorized bot and there is no competing poller. Inspect `dual-operations.json` first; position lookup can resume a pending dual exit and send token-to-SOL swaps.
 
 - **CLI observation.** Run `node cli.js candidates --limit 3`. Exit code `0` returns JSON with `candidates` and `total_screened`; each returned candidate has its pool address and configured metrics.
 - **Telegram observation.** Send `/candidates`. The bot returns the current discovery page with observation/allowlist labels and pair restrictions.
@@ -31,3 +31,4 @@ Preconditions:
 - This path uses external APIs and can fail from rate limits or unavailable providers.
 - A candidate on the observation list may fail allowlist, pair, or entry checks later.
 - A Telegram response from a different bot process is not proof for the process under test.
+- Candidate enrichment calls position lookup. Do not drive this path against a wallet with a pending dual exit merely to verify the candidate display.

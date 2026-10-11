@@ -30,7 +30,7 @@ test "$(git rev-parse --show-toplevel)" = "$PWD"
 node --version
 test -d node_modules
 npm test
-node --test test/dual-deploy.test.js test/dual-operations.test.js test/dual-ta.test.js test/dual-token-policy.test.js test/screening-report.test.js
+node --test test/dual-deploy.test.js test/dual-operations.test.js test/dual-ta.test.js test/dual-token-policy.test.js test/pnl-dual-rent.test.js test/pnl-token-valuation.test.js test/position-discovery.test.js test/screening-report.test.js
 git diff --check
 ```
 
@@ -38,13 +38,13 @@ Require Node 18+, the expected repo root, successful syntax checks, passing focu
 
 ## Drive
 
-Use `.agents/skills/verify-meridian/scripts/verify-cli-help.sh` as the no-network, no-wallet CLI entry proof. Use `node cli.js candidates --limit 3` only when API access is configured and a read-only discovery call is acceptable. For Telegram, use `/status`, `/config`, `/candidates`, and `/screen` only on the operator's authorized bot; `/screen` refreshes the deterministic candidate list in Telegram.
+Use `.agents/skills/verify-meridian/scripts/verify-cli-help.sh` as the no-network, no-wallet CLI entry proof. Use `node cli.js candidates --limit 3` only when API access is configured and the wallet has no pending dual exit: candidate enrichment looks up positions and can resume exit swaps. For Telegram, use `/status`, `/config`, `/candidates`, and `/screen` only on the operator's authorized bot after checking for pending dual exits; `/screen` refreshes the deterministic candidate list in Telegram.
 
 Never use `/deploy`, `node cli.js deploy`, `node cli.js swap`, `/close`, or `node cli.js close` for verification. They can sign real transactions when live mode is active.
 
 `DRY_RUN=true` blocks on-chain writes in the deploy implementation, but it still loads the wallet in dual mode and may call RPC, Meteora, Jupiter quote, pool-discovery, and model APIs. It can also write decision/runtime records. Do not treat dry-run as offline or use the production wallet to exercise uncertain paths. Only run `node cli.js screen --dry-run --silent` when the operator has explicitly configured the checkout for safe verification and accepts those network and local-record side effects.
 
-For dual-token partial-swap recovery, follow [Dual-token deployment and recovery](./features/dual-token-recovery.md). Current automated tests prove transaction-scoped accounting and fail-closed reconciliation. Do not fabricate or inject signed transactions into a live wallet to produce a recovery scenario. End-to-end on-chain recovery requires a disposable funded wallet and isolated RPC/chain environment; absent those, report the live path as unverified.
+For dual-token partial-swap recovery, follow [Dual-token deployment and recovery](./features/dual-token-recovery.md). For PnL and management, follow [Position value and management](./features/position-accounting.md). Current automated tests prove transaction-scoped accounting and fail-closed reconciliation. Do not fabricate or inject signed transactions into a live wallet to produce a recovery scenario. End-to-end on-chain recovery requires a disposable funded wallet and isolated RPC/chain environment; absent those, report the live path as unverified.
 
 ## Evidence
 
