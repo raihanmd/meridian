@@ -97,7 +97,7 @@ export async function quoteSolSwap({ output_mint, amount_sol }) {
   };
 }
 
-export async function resumeJupiterSwap({ signedTransaction, requestId }) {
+export async function resumeJupiterSwap({ signedTransaction, requestId, onExecutionReported }) {
   if (!signedTransaction || !requestId) throw new Error("Cannot resume Jupiter swap without the exact signed transaction and request ID");
   const key = getJupiterApiKey();
   const response = await fetch(`${JUPITER_SWAP_V2_API}/execute`, {
@@ -107,6 +107,14 @@ export async function resumeJupiterSwap({ signedTransaction, requestId }) {
     signal: AbortSignal.timeout(20_000),
   });
   const result = await response.json().catch(() => ({}));
+  await onExecutionReported?.({
+    signature: result.signature ?? null,
+    status: result.status ?? null,
+    code: result.code ?? null,
+    inputAmountResult: result.inputAmountResult ?? null,
+    outputAmountResult: result.outputAmountResult ?? null,
+    requestId,
+  });
   if (!response.ok || result.status === "Failed") {
     throw new Error(`Jupiter resumed swap failed: ${result.error || result.code || response.status}`);
   }
@@ -219,6 +227,7 @@ export async function swapToken({
   slippage_bps,
   onPrepared,
   onSubmitted,
+  onExecutionReported,
   onConfirmed,
 }) {
   input_mint  = normalizeMint(input_mint);
@@ -319,6 +328,14 @@ export async function swapToken({
     }
 
     const result = await execRes.json();
+    await onExecutionReported?.({
+      signature: result.signature ?? null,
+      status: result.status ?? null,
+      code: result.code ?? null,
+      inputAmountResult: result.inputAmountResult ?? null,
+      outputAmountResult: result.outputAmountResult ?? null,
+      requestId,
+    });
     if (result.status === "Failed") {
       throw new Error(`Swap failed on-chain: code=${result.code}`);
     }

@@ -1,6 +1,15 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { buildDualDeployPlan, computeDualPnl, validateSwapOutcome } from "../tools/dual-deploy.js";
+import {
+  addOperationTokenDelta,
+  buildDualDeployPlan,
+  calculateOperationOwnedAmounts,
+  computeDualPnl,
+  confirmedTransactionHasSigner,
+  getConfirmedOwnerMintDelta,
+  hasUnresolvedSwapTransactions,
+  validateSwapOutcome,
+} from "../tools/dual-deploy.js";
 
 const SOL = "So11111111111111111111111111111111111111112";
 const X = "TokenX11111111111111111111111111111111111";
@@ -60,4 +69,128 @@ test("separates capital movement, LP fees, execution fees, and unrecovered rent"
   assert.ok(Math.abs(pnl.netPnlPct - 15) < 1e-12);
   assert.throws(() => computeDualPnl({ rawPnlSol: 1, depositsSol: 0, budgetSol: 0 }), /cannot be negative/);
   assert.throws(() => computeDualPnl({ rawPnlSol: 1, depositsSol: 1, budgetSol: 1, transactionFeesSol: null }), /inputs are incomplete/);
+});
+
+test("attributes output to the confirmed swap transaction, independent of pre-existing wallet balances", () => {
+  const transaction = {
+    meta: {
+      err: null,
+      preTokenBalances: [
+        { owner: "wallet", mint: "USDC", uiTokenAmount: { amount: "15385906" } },
+        { owner: "wallet", mint: "STRK", uiTokenAmount: { amount: "0" } },
+      ],
+      postTokenBalances: [
+        { owner: "wallet", mint: "USDC", uiTokenAmount: { amount: "15385906" } },
+        { owner: "wallet", mint: "STRK", uiTokenAmount: { amount: "151779004048" } },
+      ],
+    },
+  };
+  assert.equal(getConfirmedOwnerMintDelta({ transaction, owner: "wallet", mint: "STRK" }), "151779004048");
+  assert.equal(getConfirmedOwnerMintDelta({ transaction, owner: "wallet", mint: "USDC" }), "0");
+  assert.equal(addOperationTokenDelta("0", "151779004048"), "151779004048");
+});
+
+test("attributes ATA creation, account closure, and multiple owned token accounts", () => {
+  const transaction = {
+    meta: {
+      err: null,
+      preTokenBalances: [
+        { accountIndex: 3, owner: "wallet", mint: "STRK", uiTokenAmount: { amount: "40" } },
+      ],
+      postTokenBalances: [
+        { accountIndex: 3, owner: "wallet", mint: "STRK", uiTokenAmount: { amount: "45" } },
+        { accountIndex: 8, owner: "wallet", mint: "STRK", uiTokenAmount: { amount: "12" } },
+        { accountIndex: 9, owner: "other", mint: "STRK", uiTokenAmount: { amount: "1000" } },
+      ],
+    },
+  };
+  assert.equal(getConfirmedOwnerMintDelta({ transaction, owner: "wallet", mint: "STRK" }), "17");
+});
+
+test("only confirmed operation-owned swaps and rollbacks determine recovery amounts", () => {
+  const transactions = [
+    { kind: "swap_x", signature: "buy-strk", status: "confirmed", metadata: { side: "x", role: "acquire", outputDeltaRaw: "151779004048" } },
+    { kind: "swap_y", signature: "buy-usdc", status: "submitted", metadata: { side: "y", role: "acquire", outputDeltaRaw: "25000000" } },
+    { kind: "rollback_x", signature: "sell-part-strk", status: "confirmed", metadata: { side: "x", role: "rollback", inputSpentRaw: "100000000000" } },
+    { kind: "swap_y", signature: "failed-usdc", status: "failed", metadata: { side: "y", role: "acquire", outputDeltaRaw: "999999999" } },
+  ];
+  assert.deepEqual(calculateOperationOwnedAmounts(transactions), {
+    x: "51779004048", y: "0", complete: true, missingSignatures: [],
+  });
+  assert.deepEqual(calculateOperationOwnedAmounts([...transactions, transactions[0]]), {
+    x: "51779004048", y: "0", complete: true, missingSignatures: [],
+  });
+});
+
+test("a failed second-side swap cannot make the operation claim or roll back pre-existing USDC", () => {
+  const operationTransactions = [
+    { kind: "swap_x", signature: "buy-strk", status: "confirmed", metadata: { side: "x", role: "acquire", outputDeltaRaw: "151779004048" } },
+    { kind: "swap_y", signature: "usdc-never-submitted", status: "failed", metadata: { side: "y", role: "acquire" } },
+  ];
+  assert.deepEqual(calculateOperationOwnedAmounts(operationTransactions), {
+    x: "151779004048", y: "0", complete: true, missingSignatures: [],
+  });
+  operationTransactions.push({
+    kind: "rollback_x", signature: "return-strk-to-sol", status: "confirmed",
+    metadata: { side: "x", role: "rollback", inputSpentRaw: "151779004048" },
+  });
+  assert.deepEqual(calculateOperationOwnedAmounts(operationTransactions), {
+    x: "0", y: "0", complete: true, missingSignatures: [],
+  });
+});
+
+test("reports missing confirmed deltas instead of guessing from a wallet balance", () => {
+  const ledger = calculateOperationOwnedAmounts([
+    { kind: "swap_y", signature: "legacy-swap", status: "confirmed", metadata: { side: "y" } },
+  ]);
+  assert.deepEqual(ledger, { x: "0", y: "0", complete: false, missingSignatures: ["legacy-swap"] });
+});
+
+test("refuses over-rollback and negative acquired amounts", () => {
+  assert.throws(() => calculateOperationOwnedAmounts([
+    { kind: "swap_x", signature: "buy", status: "confirmed", metadata: { side: "x", role: "acquire", outputDeltaRaw: "5" } },
+    { kind: "rollback_x", signature: "overspend", status: "confirmed", metadata: { side: "x", role: "rollback", inputSpentRaw: "6" } },
+  ]), /spends more/);
+  assert.throws(() => addOperationTokenDelta("0", "-1"), /cannot be negative/);
+});
+
+test("does not interpret failed, unconfirmed, or incomplete transactions as token acquisitions", () => {
+  const ledger = calculateOperationOwnedAmounts([
+    { kind: "swap_x", signature: "failed", status: "failed", metadata: { side: "x", role: "acquire", outputDeltaRaw: "9" } },
+    { kind: "swap_y", signature: "pending", status: "submitted", metadata: { side: "y", role: "acquire", outputDeltaRaw: "8" } },
+  ]);
+  assert.deepEqual(ledger, { x: "0", y: "0", complete: true, missingSignatures: [] });
+});
+
+test("waits for both mismatched Jupiter signatures to resolve before rollback or deploy", () => {
+  const transactions = [
+    { kind: "swap_x", signature: "journaled-signature", status: "superseded", metadata: { side: "x" } },
+    { kind: "swap_x_response", signature: "jupiter-response-signature", status: "submitted", metadata: { side: "x" } },
+  ];
+  assert.equal(hasUnresolvedSwapTransactions(transactions), true);
+  transactions[0].status = "failed";
+  assert.equal(hasUnresolvedSwapTransactions(transactions), true);
+  transactions[1].status = "confirmed";
+  assert.equal(hasUnresolvedSwapTransactions(transactions), false);
+});
+
+test("requires a successful confirmed transaction with owner and mint attribution", () => {
+  assert.throws(() => getConfirmedOwnerMintDelta({ transaction: {}, owner: "wallet", mint: "STRK" }), /successful confirmed/);
+  assert.throws(() => getConfirmedOwnerMintDelta({ transaction: { meta: { err: { failed: true } } }, owner: "wallet", mint: "STRK" }), /successful confirmed/);
+  assert.throws(() => getConfirmedOwnerMintDelta({ transaction: { meta: { err: null } }, owner: "", mint: "STRK" }), /requires owner and mint/);
+});
+
+test("accepts only transactions whose required signer set includes the configured wallet", () => {
+  const transaction = {
+    transaction: {
+      message: {
+        header: { numRequiredSignatures: 2 },
+        staticAccountKeys: ["fee-payer", "wallet", "program"],
+      },
+    },
+    meta: { err: null },
+  };
+  assert.equal(confirmedTransactionHasSigner(transaction, "wallet"), true);
+  assert.equal(confirmedTransactionHasSigner(transaction, "program"), false);
+  assert.equal(confirmedTransactionHasSigner({ transaction: { message: { staticAccountKeys: ["wallet"] } } }, "wallet"), false);
 });

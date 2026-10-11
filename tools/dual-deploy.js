@@ -50,6 +50,75 @@ export function validateSwapOutcome({ expectedInputLamports, actualInputLamports
   return { unusedInputLamports: (expectedInput - actualInput).toString(), outputLamports: output.toString() };
 }
 
+/**
+ * Return the exact net token delta for one owner and mint in a confirmed
+ * transaction. This is transaction scoped: wallet balances that existed
+ * before the operation, or changed in another transaction, are never counted.
+ */
+export function getConfirmedOwnerMintDelta({ transaction, owner, mint }) {
+  if (!transaction?.meta || transaction.meta.err) throw new Error("Cannot attribute token delta without a successful confirmed transaction");
+  if (!owner || !mint) throw new Error("Token delta attribution requires owner and mint");
+  const readAmount = (balances) => (balances || [])
+    .filter((entry) => entry.owner === owner && entry.mint === mint)
+    .reduce((sum, entry) => sum + BigInt(entry.uiTokenAmount?.amount ?? "0"), 0n);
+  const before = readAmount(transaction.meta.preTokenBalances);
+  const after = readAmount(transaction.meta.postTokenBalances);
+  return (after - before).toString();
+}
+
+export function confirmedTransactionHasSigner(transaction, owner) {
+  const message = transaction?.transaction?.message ?? transaction?.message;
+  const keys = message?.staticAccountKeys ?? message?.accountKeys;
+  const signerCount = Number(message?.header?.numRequiredSignatures);
+  if (!Array.isArray(keys) || !Number.isInteger(signerCount) || signerCount <= 0 || !owner) return false;
+  return keys.slice(0, signerCount).some((key) => String(key?.pubkey ?? key) === owner);
+}
+
+export function addOperationTokenDelta(priorRaw, transactionDeltaRaw) {
+  const prior = BigInt(priorRaw ?? "0");
+  const delta = BigInt(transactionDeltaRaw);
+  if (prior < 0n || delta < 0n) throw new Error("Operation-owned token amounts cannot be negative");
+  return (prior + delta).toString();
+}
+
+export function calculateOperationOwnedAmounts(transactions = []) {
+  const totals = { x: 0n, y: 0n };
+  const acquired = { x: 0n, y: 0n };
+  const spent = { x: 0n, y: 0n };
+  const missing = [];
+  const seenSignatures = new Set();
+  for (const tx of transactions) {
+    if (tx.status !== "confirmed" || seenSignatures.has(tx.signature)) continue;
+    seenSignatures.add(tx.signature);
+    const side = tx.metadata?.side ?? (tx.kind?.match(/(?:swap|rollback)_([xy])/)?.[1] ?? null);
+    if (!side) continue;
+    if (tx.metadata?.role === "acquire" || tx.kind?.startsWith(`swap_${side}`)) {
+      const amount = tx.metadata?.outputDeltaRaw;
+      if (amount == null) { missing.push(tx.signature); continue; }
+      const value = BigInt(amount);
+      if (value <= 0n) throw new Error(`Confirmed acquisition ${tx.signature} has no positive transaction-scoped token delta`);
+      acquired[side] += value;
+    } else if (tx.metadata?.role === "rollback" || tx.kind?.startsWith(`rollback_${side}`)) {
+      const amount = tx.metadata?.inputSpentRaw;
+      if (amount == null) { missing.push(tx.signature); continue; }
+      const value = BigInt(amount);
+      if (value <= 0n) throw new Error(`Confirmed rollback ${tx.signature} has no positive transaction-scoped spend`);
+      spent[side] += value;
+    }
+  }
+  for (const side of ["x", "y"]) {
+    if (spent[side] > acquired[side]) throw new Error(`Confirmed rollback spends more ${side.toUpperCase()} than this operation acquired`);
+    totals[side] = acquired[side] - spent[side];
+  }
+  return { x: totals.x.toString(), y: totals.y.toString(), complete: missing.length === 0, missingSignatures: missing };
+}
+
+export function hasUnresolvedSwapTransactions(transactions = []) {
+  return transactions.some((transaction) =>
+    ["signed", "submitted", "superseded"].includes(transaction.status)
+      && (transaction.kind?.startsWith("swap_") || transaction.kind?.startsWith("rollback_")));
+}
+
 export function computeDualPnl({ rawPnlSol, depositsSol, budgetSol, feeIncomeSol = 0, transactionFeesSol = 0, rentPaidSol = 0, rentRecoveredSol = 0 }) {
   if ([rawPnlSol, depositsSol, budgetSol, feeIncomeSol, transactionFeesSol, rentPaidSol, rentRecoveredSol].some((value) => value == null || value === "")) {
     throw new Error("Dual PnL inputs are incomplete; fee and rent accounting must be verified");

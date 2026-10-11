@@ -666,6 +666,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
     let deployAttempted = false;
     let deploySucceeded = false;
     let simulatedDeploy = null;
+    let deployRecovery = null;
     const { content } = await agentLoop(`
 SCREENING CYCLE
 ${strategyWithContext}
@@ -742,6 +743,13 @@ IMPORTANT:
             deployAttempted = true;
             deploySucceeded = Boolean(success && result?.success !== false && !result?.error && !result?.blocked);
             if (deploySucceeded && result?.dry_run) simulatedDeploy = result;
+            if (result?.recovery_pending || result?.recovered) {
+              deployRecovery = {
+                pending: Boolean(result.recovery_pending),
+                recovered: Boolean(result.recovered),
+                operationId: result.operation_id || null,
+              };
+            }
           }
           await liveMessage?.toolFinish(name, result, success);
         },
@@ -749,6 +757,12 @@ IMPORTANT:
     screenReport = simulatedDeploy ? formatDryRunDeploy(simulatedDeploy, passing.map(({ pool }) => pool)) : content;
     if (!deploySucceeded && /^\s*(?:🚀\s*DEPLOYED|🧪\s*DRY RUN\s*·\s*WOULD DEPLOY)/i.test(screenReport)) {
       screenReport = "⛔ NO DEPLOY\n\nThe agent reported a deploy, but no successful deploy_position result was recorded. Check bot logs.";
+    }
+    if (deployRecovery) {
+      const recoveryNotice = deployRecovery.recovered
+        ? "✅ Operasi dihentikan tanpa deploy. Tidak ada token hasil operasi tertinggal di luar SOL; saldo token sebelum operasi tidak ikut dipakai dalam pemulihan. Screening akan dimulai ulang pada siklus berikutnya."
+        : `⏳ Pemulihan masih berjalan${deployRecovery.operationId ? ` (${deployRecovery.operationId})` : ""}. Bot tidak deploy dan tidak akan memakai saldo token wallet sebagai bukti hasil swap. Hindari transaksi manual sampai rekonsiliasi selesai.`;
+      screenReport = `${screenReport}\n\nDEPLOY RECOVERY\n${recoveryNotice}`;
     }
     if (!simulatedDeploy && /⛔\s*NO DEPLOY/i.test(content)) {
       appendDecision({

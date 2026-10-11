@@ -115,8 +115,11 @@ export function createDualOperationJournal({ filePath = repoPath("dual-operation
   return {
     async withPoolLock(poolAddress, walletAddress, callback) {
       if (!poolAddress || !walletAddress || typeof callback !== "function") throw new Error("Pool operation lock needs pool, wallet, and callback");
-      const key = createHash("sha256").update(`${walletAddress}:${poolAddress}`).digest("hex");
-      return withFileLock(`${filePath}.${key}.operation.lock`, callback, { timeoutMs: 180_000 });
+      // Every dual operation for one wallet shares fungible token balances.
+      // Serialize across pools so rollback for one operation cannot spend
+      // tokens acquired by another concurrent operation.
+      const key = createHash("sha256").update(walletAddress).digest("hex");
+      return withFileLock(`${filePath}.${key}.wallet-operation.lock`, callback, { timeoutMs: 180_000 });
     },
     async list({ includeTerminal = false } = {}) {
       const journal = await readJournal(filePath);
@@ -151,7 +154,7 @@ export function createDualOperationJournal({ filePath = repoPath("dual-operation
         return operation;
       });
     },
-    async recordTransaction(id, { kind, signature, status = "submitted", metadata = {} }) {
+    async recordTransaction(id, { kind, signature, status = "submitted", metadata = {}, operationPatch = {} }) {
       if (!kind || !signature) throw new Error("Transaction record needs kind and signature");
       return updateJournal(filePath, (journal) => {
         const operation = journal.operations.find((entry) => entry.id === id);
@@ -159,7 +162,7 @@ export function createDualOperationJournal({ filePath = repoPath("dual-operation
         const existing = operation.transactions.find((tx) => tx.signature === signature);
         if (!existing) operation.transactions.push({ kind, signature, status, metadata, recordedAt: new Date().toISOString() });
         else Object.assign(existing, { kind, status, metadata: { ...existing.metadata, ...metadata }, updatedAt: new Date().toISOString() });
-        operation.updatedAt = new Date().toISOString();
+        Object.assign(operation, operationPatch, { updatedAt: new Date().toISOString() });
         return operation;
       });
     },

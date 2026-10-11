@@ -47,7 +47,7 @@ test("serializes concurrent updates and refuses terminal-state rewrites", async 
   }
 });
 
-test("locks deployment attempts by pool and wallet across journal instances", async () => {
+test("serializes dual operations for one wallet across pools and journal instances", async () => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), "meridian-dual-lock-"));
   const filePath = path.join(directory, "operations.json");
   try {
@@ -55,14 +55,15 @@ test("locks deployment attempts by pool and wallet across journal instances", as
     const second = createDualOperationJournal({ filePath });
     let active = 0;
     let peak = 0;
-    const run = (journal) => journal.withPoolLock("pool", "wallet", async () => {
+    const run = (journal, pool) => journal.withPoolLock(pool, "wallet", async () => {
       active++;
       peak = Math.max(peak, active);
       await new Promise((resolve) => setTimeout(resolve, 40));
       active--;
     });
-    await Promise.all([run(first), run(second)]);
+    await Promise.all([run(first, "pool-a"), run(second, "pool-b")]);
     assert.equal(peak, 1);
+    await Promise.all([first.withPoolLock("pool-a", "wallet-a", async () => {}), second.withPoolLock("pool-b", "wallet-b", async () => {})]);
   } finally {
     await fs.rm(directory, { recursive: true, force: true });
   }
@@ -75,6 +76,27 @@ test("fails closed when the journal path cannot be durably written", async () =>
     await fs.mkdir(filePath);
     const journal = createDualOperationJournal({ filePath });
     await assert.rejects(() => journal.create({ idempotencyKey: "k", poolAddress: "p", walletAddress: "w" }), /EISDIR|durably persist/);
+  } finally {
+    await fs.rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("persists confirmed transaction evidence and owned-token ledger atomically", async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "meridian-dual-journal-"));
+  const filePath = path.join(directory, "operations.json");
+  try {
+    const journal = createDualOperationJournal({ filePath });
+    const operation = await journal.create({ idempotencyKey: "atomic", poolAddress: "pool", walletAddress: "wallet" });
+    await journal.recordTransaction(operation.id, {
+      kind: "swap_y", signature: "confirmed-buy", status: "confirmed",
+      metadata: { role: "acquire", side: "y", outputDeltaRaw: "15385906" },
+      operationPatch: { acquiredRaw: { x: "0", y: "15385906" }, stage: "recovery_pending" },
+    });
+    const restored = await createDualOperationJournal({ filePath }).get(operation.id);
+    assert.equal(restored.stage, "recovery_pending");
+    assert.deepEqual(restored.acquiredRaw, { x: "0", y: "15385906" });
+    assert.equal(restored.transactions[0].status, "confirmed");
+    assert.equal(restored.transactions[0].metadata.outputDeltaRaw, "15385906");
   } finally {
     await fs.rm(directory, { recursive: true, force: true });
   }

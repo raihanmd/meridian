@@ -33,7 +33,17 @@ import { getAndClearStagedSignals } from "../signal-tracker.js";
 import { computePositions, fetchDlmmPnlForPool } from "./pnl.js";
 import { getDualPoolRestrictionReason, getPoolRestrictionReason } from "../token-allowlist.js";
 import { analyzeDualTokenRange, fetchDualTokenOhlcv } from "./dual-ta.js";
-import { buildDualDeployPlan, computeDualPnl, computeDualValueSplit, validateSwapOutcome } from "./dual-deploy.js";
+import {
+  addOperationTokenDelta,
+  buildDualDeployPlan,
+  calculateOperationOwnedAmounts,
+  confirmedTransactionHasSigner,
+  computeDualPnl,
+  computeDualValueSplit,
+  getConfirmedOwnerMintDelta,
+  hasUnresolvedSwapTransactions,
+  validateSwapOutcome,
+} from "./dual-deploy.js";
 import { dualOperationJournal } from "./dual-operations.js";
 
 // ─── Lazy SDK loader ───────────────────────────────────────────
@@ -386,6 +396,65 @@ async function getConfirmedTransactionFeeSol(signature) {
   return null;
 }
 
+async function getConfirmedTransaction(signature) {
+  return getConnection().getTransaction(signature, {
+    commitment: "confirmed",
+    maxSupportedTransactionVersion: 0,
+  }).catch(() => null);
+}
+
+function dualSwapSide(transaction) {
+  return transaction.metadata?.side ?? transaction.kind?.match(/(?:swap|rollback)_([xy])/)?.[1] ?? null;
+}
+
+function dualTransactionMint(operation, transaction) {
+  const side = dualSwapSide(transaction);
+  const isRollback = transaction.metadata?.role === "rollback" || transaction.kind.startsWith("rollback_");
+  return (isRollback ? transaction.metadata?.input_mint : transaction.metadata?.output_mint)
+    ?? (side === "x" ? operation.plan.token_x_mint : operation.plan.token_y_mint);
+}
+
+async function recordJupiterExecutionResponse(operationId, transaction, response) {
+  const signature = response?.signature;
+  const metadata = {
+    executionStatus: response?.status ?? null,
+    executionCode: response?.code ?? null,
+    executionInputRaw: response?.inputAmountResult ?? null,
+    executionOutputRaw: response?.outputAmountResult ?? null,
+    executionReportedAt: new Date().toISOString(),
+  };
+  if (!signature) {
+    await dualOperationJournal.recordTransaction(operationId, { ...transaction, metadata });
+    return;
+  }
+  if (signature === transaction.signature) {
+    await dualOperationJournal.recordTransaction(operationId, { ...transaction, status: "submitted", metadata });
+    return;
+  }
+
+  await dualOperationJournal.recordTransaction(operationId, {
+    ...transaction,
+    status: "superseded",
+    metadata: { ...metadata, responseSignature: signature },
+  });
+  await dualOperationJournal.recordTransaction(operationId, {
+    kind: `${transaction.kind}_response`,
+    signature,
+    status: "submitted",
+    metadata: {
+      side: dualSwapSide(transaction),
+      role: transaction.kind.startsWith("rollback_") ? "rollback" : "acquire",
+      input_mint: transaction.metadata?.input_mint,
+      output_mint: transaction.metadata?.output_mint,
+      amount_raw: transaction.metadata?.amount_raw,
+      requestId: transaction.metadata?.requestId,
+      lastValidBlockHeight: transaction.metadata?.lastValidBlockHeight,
+      relatedSignature: transaction.signature,
+      ...metadata,
+    },
+  });
+}
+
 function sumRecordedDualTransactionFees(operation) {
   const confirmed = (operation.transactions || []).filter((transaction) => transaction.status === "confirmed");
   if (confirmed.some((transaction) => transaction.metadata?.feeSol == null || !Number.isFinite(Number(transaction.metadata.feeSol)))) return null;
@@ -454,7 +523,39 @@ async function finalizeDualPosition(operation, pool, wallet) {
 }
 
 async function reconcileDualOperation(operation, pool, wallet) {
-  const unresolved = (operation.transactions || []).filter((transaction) => transaction.status === "signed");
+  for (const transaction of operation.transactions || []) {
+    if (transaction.status !== "confirmed") continue;
+    const isAcquire = transaction.kind.startsWith("swap_");
+    const isRollback = transaction.kind.startsWith("rollback_");
+    if (!isAcquire && !isRollback) continue;
+    const recordedAmount = isRollback ? transaction.metadata?.inputSpentRaw : transaction.metadata?.outputDeltaRaw;
+    if (recordedAmount != null) continue;
+    const confirmedTx = await getConfirmedTransaction(transaction.signature);
+    if (!confirmedTx?.meta || confirmedTx.meta.err || !confirmedTransactionHasSigner(confirmedTx, wallet.publicKey.toString())) {
+      return { success: false, recovery_pending: true, operation_id: operation.id, error: `Legacy confirmed swap ${transaction.signature} has no verifiable transaction evidence; manual reconciliation required` };
+    }
+    const mint = dualTransactionMint(operation, transaction);
+    const side = dualSwapSide(transaction);
+    if (!mint || !side) return { success: false, recovery_pending: true, operation_id: operation.id, error: `Legacy confirmed swap ${transaction.signature} lacks mint/side attribution` };
+    const delta = BigInt(getConfirmedOwnerMintDelta({ transaction: confirmedTx, owner: wallet.publicKey.toString(), mint }));
+    if ((isRollback && delta >= 0n) || (isAcquire && delta <= 0n)) {
+      return { success: false, recovery_pending: true, operation_id: operation.id, error: `Legacy confirmed swap ${transaction.signature} has no attributable token delta` };
+    }
+    await dualOperationJournal.recordTransaction(operation.id, {
+      ...transaction,
+      status: "confirmed",
+      metadata: {
+        ...transaction.metadata,
+        side,
+        role: isRollback ? "rollback" : "acquire",
+        ...(isRollback ? { inputSpentRaw: (-delta).toString() } : { outputDeltaRaw: delta.toString() }),
+        feeSol: transaction.metadata?.feeSol ?? (Number.isFinite(confirmedTx.meta.fee) ? confirmedTx.meta.fee / 1e9 : null),
+        deltaRecoveredFromRpc: true,
+      },
+    });
+  }
+  operation = await dualOperationJournal.get(operation.id);
+  const unresolved = (operation.transactions || []).filter((transaction) => ["signed", "submitted", "superseded"].includes(transaction.status));
   for (const transaction of unresolved) {
     const status = await readSignatureStatus(transaction.signature);
     if (status?.err) {
@@ -462,70 +563,84 @@ async function reconcileDualOperation(operation, pool, wallet) {
       continue;
     }
     if (status?.confirmationStatus === "confirmed" || status?.confirmationStatus === "finalized") {
-      const feeSol = transaction.metadata?.feeSol ?? await getConfirmedTransactionFeeSol(transaction.signature);
-      await dualOperationJournal.recordTransaction(operation.id, { ...transaction, status: "confirmed", metadata: { feeSol } });
-      operation.transactionFeesSol = sumRecordedDualTransactionFees(await dualOperationJournal.get(operation.id));
-      if (transaction.kind.startsWith("swap_")) {
-        const side = transaction.kind.slice(-1);
-        const mint = side === "x" ? operation.plan.token_x_mint : operation.plan.token_y_mint;
-        const baseline = BigInt(transaction.metadata?.baselineRaw ?? operation.tokenBaselineRaw?.[side] ?? "0");
-        const current = BigInt(await getMintBalanceRaw(wallet.publicKey, mint));
-        if (current > baseline) operation.acquiredRaw = { ...(operation.acquiredRaw || {}), [side]: (current - baseline).toString() };
-      } else if (transaction.kind.startsWith("rollback_")) {
-        const side = transaction.kind.slice(-1);
-        operation.acquiredRaw = { ...(operation.acquiredRaw || {}), [side]: "0" };
+      const confirmedTx = await getConfirmedTransaction(transaction.signature);
+      if (!confirmedTx?.meta || confirmedTx.meta.err) continue;
+      const isRollback = transaction.metadata?.role === "rollback" || transaction.kind.startsWith("rollback_");
+      const side = dualSwapSide(transaction);
+      if (!side || !transaction.kind.startsWith("swap_") && !isRollback) continue;
+      const mint = dualTransactionMint(operation, transaction);
+      if (!mint) continue;
+      if (!confirmedTransactionHasSigner(confirmedTx, wallet.publicKey.toString())) {
+        await dualOperationJournal.transition(operation.id, "recovery_pending", {
+          recoveryError: `Confirmed transaction ${transaction.signature} is not signed by this wallet; manual reconciliation required`,
+        });
+        return { success: false, recovery_pending: true, operation_id: operation.id, error: "Confirmed signature is not signed by the configured wallet; no token balance was attributed" };
       }
-      await dualOperationJournal.transition(operation.id, "recovery_pending", {
-        acquiredRaw: operation.acquiredRaw || { x: "0", y: "0" },
-        transactionFeesSol: operation.transactionFeesSol,
+      const deltaRaw = getConfirmedOwnerMintDelta({ transaction: confirmedTx, owner: wallet.publicKey.toString(), mint });
+      const amountRaw = BigInt(deltaRaw);
+      if ((isRollback && amountRaw >= 0n) || (!isRollback && amountRaw <= 0n)) {
+        await dualOperationJournal.transition(operation.id, "recovery_pending", {
+          recoveryError: `Confirmed transaction ${transaction.signature} has no attributable ${isRollback ? "token spend" : "token output"}; manual reconciliation required`,
+        });
+        return { success: false, recovery_pending: true, operation_id: operation.id, error: "Confirmed swap token movement could not be attributed; no wallet balance fallback was used" };
+      }
+      const feeSol = Number.isFinite(confirmedTx.meta.fee) ? confirmedTx.meta.fee / 1e9 : null;
+      const metadata = {
+        ...transaction.metadata,
+        side,
+        role: isRollback ? "rollback" : "acquire",
+        ...(isRollback ? { inputSpentRaw: (-amountRaw).toString() } : { outputDeltaRaw: amountRaw.toString() }),
+        feeSol,
+      };
+      const latest = await dualOperationJournal.get(operation.id);
+      const updatedTransactions = (latest.transactions || []).map((entry) => entry.signature === transaction.signature
+        ? { ...entry, status: "confirmed", metadata: { ...entry.metadata, ...metadata } }
+        : entry);
+      const owned = calculateOperationOwnedAmounts(updatedTransactions);
+      if (!owned.complete) {
+        await dualOperationJournal.recordTransaction(operation.id, { ...transaction, status: "confirmed", metadata: { ...metadata, attributionError: "another confirmed operation transaction lacks exact token deltas" } });
+        await dualOperationJournal.transition(operation.id, "recovery_pending", { recoveryError: `Exact token deltas are missing for ${owned.missingSignatures.join(", ")}` });
+        return { success: false, recovery_pending: true, operation_id: operation.id, error: "A confirmed transaction is missing exact token deltas; manual reconciliation required" };
+      }
+      operation.acquiredRaw = { x: owned.x, y: owned.y };
+      await dualOperationJournal.recordTransaction(operation.id, {
+        ...transaction,
+        status: "confirmed",
+        metadata,
+        operationPatch: {
+          acquiredRaw: operation.acquiredRaw,
+          transactionFeesSol: sumRecordedDualTransactionFees({ transactions: updatedTransactions }),
+        },
       });
       continue;
     }
 
-    const signed = transaction.metadata?.signedTransaction;
-    if (!signed || !(await signedTransactionStillValid(signed))) {
+    const lastValidBlockHeight = Number(transaction.metadata?.lastValidBlockHeight);
+    const currentBlockHeight = Number.isFinite(lastValidBlockHeight) ? await getConnection().getBlockHeight("confirmed") : null;
+    if (Number.isFinite(lastValidBlockHeight) && currentBlockHeight > lastValidBlockHeight) {
       await dualOperationJournal.recordTransaction(operation.id, { ...transaction, status: "expired" });
-      if (transaction.kind.startsWith("swap_")) {
-        const side = transaction.kind.slice(-1);
-        const mint = side === "x" ? operation.plan.token_x_mint : operation.plan.token_y_mint;
-        const baseline = BigInt(transaction.metadata?.baselineRaw ?? operation.tokenBaselineRaw?.[side] ?? "0");
-        const current = BigInt(await getMintBalanceRaw(wallet.publicKey, mint));
-        operation.acquiredRaw = {
-          ...(operation.acquiredRaw || {}),
-          [side]: current > baseline ? (current - baseline).toString() : "0",
-        };
-        await dualOperationJournal.transition(operation.id, "recovery_pending", { acquiredRaw: operation.acquiredRaw });
-      }
       continue;
     }
-    if (transaction.kind.startsWith("rollback_")) {
-      const result = await resumeJupiterSwap({ signedTransaction: signed, requestId: transaction.metadata.requestId }).catch(() => null);
-      if (result?.success) {
-        if (result.tx !== transaction.signature) throw new Error("Jupiter rollback resume returned a different journaled signature");
-        const feeSol = await getConfirmedTransactionFeeSol(transaction.signature);
-        await dualOperationJournal.recordTransaction(operation.id, { ...transaction, status: "confirmed", metadata: { ...result, feeSol } });
-        const side = transaction.kind.slice(-1);
-        operation.acquiredRaw = { ...(operation.acquiredRaw || {}), [side]: "0" };
-        await dualOperationJournal.transition(operation.id, "recovery_pending", { acquiredRaw: operation.acquiredRaw });
-      }
-      continue;
-    }
-    const result = await resumeJupiterSwap({ signedTransaction: signed, requestId: transaction.metadata.requestId }).catch(() => null);
-    if (result?.success) {
-      if (result.tx !== transaction.signature) throw new Error("Jupiter resume returned a different signature than the journaled transaction");
-      const side = transaction.kind.slice(-1);
-      const mint = side === "x" ? operation.plan.token_x_mint : operation.plan.token_y_mint;
-      const baseline = BigInt(transaction.metadata?.baselineRaw ?? operation.tokenBaselineRaw?.[side] ?? "0");
-      const current = BigInt(await getMintBalanceRaw(wallet.publicKey, mint));
-      const acquired = current > baseline ? (current - baseline).toString() : "0";
-      operation.acquiredRaw = { ...(operation.acquiredRaw || {}), [side]: acquired };
-      operation.swapResults = { ...(operation.swapResults || {}), [side]: result };
-      const feeSol = await getConfirmedTransactionFeeSol(transaction.signature);
-      await dualOperationJournal.recordTransaction(operation.id, { ...transaction, status: "confirmed", metadata: { ...result, feeSol } });
-      operation.transactionFeesSol = sumRecordedDualTransactionFees(await dualOperationJournal.get(operation.id));
-      await dualOperationJournal.transition(operation.id, "recovery_pending", { acquiredRaw: operation.acquiredRaw, swapResults: operation.swapResults, transactionFeesSol: operation.transactionFeesSol });
+
+    const signed = transaction.metadata?.signedTransaction;
+    if (!signed || transaction.metadata?.responseSignature || transaction.kind.endsWith("_response") || !(await signedTransactionStillValid(signed))) continue;
+    const result = await resumeJupiterSwap({
+      signedTransaction: signed,
+      requestId: transaction.metadata.requestId,
+      onExecutionReported: async (response) => recordJupiterExecutionResponse(operation.id, transaction, response),
+    }).catch(() => null);
+    if (result?.success && result.tx !== transaction.signature) {
+      return { success: false, recovery_pending: true, operation_id: operation.id, error: "Jupiter returned a different signature while resuming; both signatures are being reconciled before any recovery swap" };
     }
   }
+
+  operation = await dualOperationJournal.get(operation.id);
+  const pendingSwap = hasUnresolvedSwapTransactions(operation.transactions || []);
+  if (pendingSwap) return { success: false, recovery_pending: true, operation_id: operation.id, error: "A swap signature is still unresolved; waiting before retrying or converting assets" };
+
+  const ledger = calculateOperationOwnedAmounts(operation.transactions || []);
+  if (!ledger.complete) return { success: false, recovery_pending: true, operation_id: operation.id, error: `Exact transaction token deltas are unavailable for ${ledger.missingSignatures.join(", ")}; manual reconciliation required` };
+  operation.acquiredRaw = { x: ledger.x, y: ledger.y };
 
   operation = await dualOperationJournal.get(operation.id);
   if (operation.positionSignature) {
@@ -600,25 +715,50 @@ async function reconcileDualOperation(operation, pool, wallet) {
           operation.rollbackSignatures[side] = prepared.signature;
           await dualOperationJournal.recordTransaction(operation.id, {
             kind: `rollback_${side}`, signature: prepared.signature, status: "signed",
-            metadata: { ...prepared, baselineRaw: "0" },
+            metadata: { ...prepared, side, role: "rollback", amount_raw: amountRaw.toString() },
           });
+        },
+        onExecutionReported: async (response) => {
+          const current = await dualOperationJournal.get(operation.id);
+          const intent = current.transactions.find((entry) => entry.signature === operation.rollbackSignatures?.[side]);
+          if (intent) await recordJupiterExecutionResponse(operation.id, intent, response);
         },
       });
       if (!returned?.success) throw new Error(returned?.error || "Rollback swap failed");
       if (returned.tx !== operation.rollbackSignatures?.[side]) throw new Error("Rollback returned a different signature than the journaled transaction");
-      await dualOperationJournal.recordTransaction(operation.id, { kind: `rollback_${side}`, signature: returned.tx, status: "confirmed", metadata: returned });
-      acquiredRaw[side] = "0";
-      await dualOperationJournal.transition(operation.id, "recovery_pending", { acquiredRaw: { ...acquiredRaw } });
+      const confirmedTx = await getConfirmedTransaction(returned.tx);
+      if (!confirmedTx?.meta || confirmedTx.meta.err) throw new Error("Jupiter reported rollback success but RPC cannot verify the transaction yet");
+      if (!confirmedTransactionHasSigner(confirmedTx, wallet.publicKey.toString())) throw new Error("Confirmed rollback transaction is not signed by the configured wallet");
+      const tokenDelta = BigInt(getConfirmedOwnerMintDelta({ transaction: confirmedTx, owner: wallet.publicKey.toString(), mint }));
+      if (tokenDelta >= 0n || -tokenDelta > amountRaw) throw new Error("Confirmed rollback token spend is missing or exceeds the operation-owned amount");
+      const inputSpentRaw = (-tokenDelta).toString();
+      const rollbackMetadata = { ...returned, side, role: "rollback", inputSpentRaw, feeSol: confirmedTx.meta.fee / 1e9 };
+      const current = await dualOperationJournal.get(operation.id);
+      const updatedTransactions = current.transactions.map((entry) => entry.signature === returned.tx
+        ? { ...entry, status: "confirmed", metadata: { ...entry.metadata, ...rollbackMetadata } }
+        : entry);
+      const owned = calculateOperationOwnedAmounts(updatedTransactions);
+      if (!owned.complete) throw new Error("Cannot verify the remaining operation-owned token balance after rollback");
+      acquiredRaw.x = owned.x;
+      acquiredRaw.y = owned.y;
+      await dualOperationJournal.recordTransaction(operation.id, {
+        kind: `rollback_${side}`, signature: returned.tx, status: "confirmed", metadata: rollbackMetadata,
+        operationPatch: { acquiredRaw: { ...acquiredRaw } },
+      });
     } catch (error) {
       await dualOperationJournal.transition(operation.id, "recovery_pending", { acquiredRaw: { ...acquiredRaw }, recoveryError: error.message });
       return { success: false, recovery_pending: true, operation_id: operation.id, error: error.message };
     }
   }
   const finalState = await dualOperationJournal.get(operation.id);
-  if ((finalState.transactions || []).some((transaction) => transaction.status === "signed")) {
+  if ((finalState.transactions || []).some((transaction) => ["signed", "submitted", "superseded"].includes(transaction.status))) {
     return { success: false, recovery_pending: true, operation_id: operation.id, error: "A submitted transaction still needs chain confirmation" };
   }
-  await dualOperationJournal.transition(operation.id, "cancelled", { acquiredRaw: { ...acquiredRaw }, cancelledAt: new Date().toISOString() });
+  const finalLedger = calculateOperationOwnedAmounts(finalState.transactions || []);
+  if (!finalLedger.complete || finalLedger.x !== "0" || finalLedger.y !== "0") {
+    return { success: false, recovery_pending: true, operation_id: operation.id, error: "Recovery is incomplete; operation-owned tokens remain and will not be spent from the wallet balance" };
+  }
+  await dualOperationJournal.transition(operation.id, "cancelled", { acquiredRaw: { x: "0", y: "0" }, cancelledAt: new Date().toISOString() });
   return { success: false, recovery_pending: false, operation_id: operation.id, recovered: true, error: "Previous dual-token deploy was rolled back to SOL; start a fresh screening cycle" };
 }
 
@@ -925,17 +1065,13 @@ async function deployDualTokenPositionLocked(args) {
     reserveSol,
   });
   const acquiredRaw = { x: "0", y: "0" };
-  const tokenBaselineRaw = {};
   const swapResults = {};
   try {
     for (const swap of plan.swaps) {
       const quote = quotes[swap.side];
       const pendingStage = swap.side === "x" ? "swap_x_pending" : "swap_y_pending";
-      const baselineRaw = await getMintBalanceRaw(wallet.publicKey, swap.outputMint);
-      tokenBaselineRaw[swap.side] = baselineRaw;
       await dualOperationJournal.transition(operation.id, pendingStage, {
         acquiredRaw: { ...acquiredRaw },
-        tokenBaselineRaw: { ...tokenBaselineRaw },
         currentSwapSide: swap.side,
       });
       let preparedSignature = null;
@@ -953,23 +1089,54 @@ async function deployDualTokenPositionLocked(args) {
             kind: `swap_${swap.side}`,
             signature: prepared.signature,
             status: "signed",
-            metadata: { ...prepared, quote: { ...quote }, baselineRaw },
+            metadata: { ...prepared, side: swap.side, role: "acquire", quote: { ...quote } },
           });
+        },
+        onExecutionReported: async (response) => {
+          const current = await dualOperationJournal.get(operation.id);
+          const intent = current.transactions.find((entry) => entry.signature === preparedSignature);
+          if (intent) await recordJupiterExecutionResponse(operation.id, intent, response);
         },
       });
       if (!result?.success) throw new Error(result?.error || `Jupiter ${swap.side.toUpperCase()} swap failed`);
       if (result.tx !== preparedSignature) {
         throw new Error("Jupiter execution returned a signature that differs from the journaled signed transaction");
       }
+      const confirmedTx = await getConfirmedTransaction(result.tx);
+      if (!confirmedTx?.meta || confirmedTx.meta.err) throw new Error("Jupiter reported success but RPC cannot verify the confirmed swap transaction yet");
+      if (!confirmedTransactionHasSigner(confirmedTx, wallet.publicKey.toString())) throw new Error("Confirmed Jupiter transaction is not signed by the configured wallet");
+      const outputDeltaRaw = getConfirmedOwnerMintDelta({
+        transaction: confirmedTx,
+        owner: wallet.publicKey.toString(),
+        mint: swap.outputMint,
+      });
+      if (BigInt(outputDeltaRaw) <= 0n) throw new Error("Confirmed Jupiter transaction did not produce an attributable output-token balance increase");
+      acquiredRaw[swap.side] = addOperationTokenDelta(acquiredRaw[swap.side], outputDeltaRaw);
+      const swapFeeSol = Number.isFinite(confirmedTx.meta.fee) ? confirmedTx.meta.fee / 1e9 : null;
+      const confirmedMetadata = { ...result, side: swap.side, role: "acquire", outputDeltaRaw, feeSol: swapFeeSol };
+      await dualOperationJournal.recordTransaction(operation.id, {
+        kind: `swap_${swap.side}`,
+        signature: result.tx,
+        status: "confirmed",
+        metadata: confirmedMetadata,
+        operationPatch: {
+          acquiredRaw: { ...acquiredRaw },
+          transactionFeesSol: sumRecordedDualTransactionFees({
+            transactions: (await dualOperationJournal.get(operation.id)).transactions.map((entry) => entry.signature === result.tx
+              ? { ...entry, status: "confirmed", metadata: { ...entry.metadata, ...confirmedMetadata } }
+              : entry),
+          }),
+        },
+      });
       const outcome = validateSwapOutcome({
         expectedInputLamports: quote.in_amount,
         actualInputLamports: result.amount_in,
         minOutput: quote.min_out_amount,
-        actualOutput: result.amount_out,
+        actualOutput: outputDeltaRaw,
       });
-      acquiredRaw[swap.side] = outcome.outputLamports;
-      const swapFeeSol = await getConfirmedTransactionFeeSol(result.tx);
-      await dualOperationJournal.recordTransaction(operation.id, { kind: `swap_${swap.side}`, signature: result.tx, status: "confirmed", metadata: { ...result, feeSol: swapFeeSol } });
+      if (result.amount_out != null && BigInt(result.amount_out) !== BigInt(outputDeltaRaw)) {
+        throw new Error("Jupiter output amount does not match the confirmed wallet token delta; recovery will use the on-chain delta");
+      }
       operation.transactionFeesSol = sumRecordedDualTransactionFees(await dualOperationJournal.get(operation.id));
       const confirmedStage = swap.side === "x" ? "swap_x_confirmed" : "swap_y_confirmed";
       swapResults[swap.side] = result;
@@ -1058,55 +1225,32 @@ async function deployDualTokenPositionLocked(args) {
     };
   } catch (error) {
     const latest = await dualOperationJournal.get(operation.id);
+    let recoveryResult = null;
     if (latest && !["completed", "cancelled"].includes(latest.stage)) {
-      let recoveryFailed = false;
-      if (!latest.positionSignature) {
-        for (const side of ["x", "y"]) {
-          const rawAmount = BigInt(acquiredRaw[side] || "0");
-          const mint = side === "x" ? mintX : mintY;
-          if (rawAmount <= 0n || mint === config.tokens.SOL) continue;
-          try {
-            const info = await getConnection().getParsedAccountInfo(new PublicKey(mint), "confirmed");
-            const decimals = info.value?.data?.parsed?.info?.decimals;
-            if (!Number.isInteger(decimals)) throw new Error(`Token decimals unavailable for ${mint}`);
-            const returned = await swapToken({
-              input_mint: mint,
-              output_mint: config.tokens.SOL,
-              amount_raw: rawAmount.toString(),
-              input_decimals: decimals,
-              onPrepared: async (prepared) => dualOperationJournal.recordTransaction(operation.id, {
-                kind: `rollback_${side}`,
-                signature: prepared.signature,
-                status: "signed",
-                metadata: prepared,
-              }),
-            });
-            if (!returned?.success) throw new Error(returned?.error || `Rollback swap failed for ${mint}`);
-            await dualOperationJournal.recordTransaction(operation.id, { kind: `rollback_${side}`, signature: returned.tx, status: "confirmed", metadata: returned });
-            acquiredRaw[side] = "0";
-            await dualOperationJournal.transition(operation.id, "recovery_pending", {
-              recoveryError: error.message,
-              recoveryResults: { ...(latest.recoveryResults || {}), [side]: returned },
-              acquiredRaw: { ...acquiredRaw },
-            });
-          } catch (recoveryError) {
-            recoveryFailed = true;
-            log("dual_recovery_error", `Operation ${operation.id} could not return ${mint.slice(0, 8)} to SOL: ${recoveryError.message}`);
-          }
-        }
-      } else {
-        recoveryFailed = true;
-      }
-      const afterRecovery = await dualOperationJournal.get(operation.id);
-      const unresolvedTx = (afterRecovery?.transactions || []).some((transaction) => transaction.status === "signed");
-      if (!recoveryFailed && !unresolvedTx && acquiredRaw.x === "0" && acquiredRaw.y === "0" && !afterRecovery?.positionSignature) {
-        await dualOperationJournal.transition(operation.id, "cancelled", { recoveryError: error.message, cancelledAt: new Date().toISOString() }).catch(() => {});
-      } else {
-        await dualOperationJournal.transition(operation.id, "recovery_pending", { recoveryError: error.message, acquiredRaw: { ...acquiredRaw } }).catch(() => {});
+      await dualOperationJournal.transition(operation.id, "recovery_pending", {
+        recoveryError: error.message,
+        acquiredRaw: { ...acquiredRaw },
+      }).catch(() => {});
+      recoveryResult = await reconcileDualOperation(latest, pool, wallet).catch((recoveryError) => {
+        log("dual_recovery_error", `Operation ${operation.id} reconciliation failed: ${recoveryError.message}`);
+        return null;
+      });
+      if (recoveryResult?.recovery_pending) {
+        log("dual_recovery_pending", `Operation ${operation.id} awaits reconciliation: ${recoveryResult.error || error.message}`);
+      } else if (recoveryResult?.recovered) {
+        log("dual_recovery", `Operation ${operation.id} returned operation-owned assets to SOL; fresh screening is required`);
       }
     }
     log("dual_deploy_error", `Operation ${operation.id} requires reconciliation: ${error.message}`);
-    return { success: false, recovery_pending: true, operation_id: operation.id, error: error.message };
+    return {
+      success: false,
+      recovery_pending: recoveryResult?.recovery_pending ?? true,
+      recovered: recoveryResult?.recovered ?? false,
+      operation_id: operation.id,
+      error: recoveryResult?.recovered
+        ? "Deployment was cancelled safely; no operation-owned pool tokens remain outside SOL. A fresh screening cycle is required."
+        : recoveryResult?.error || error.message,
+    };
   }
 }
 

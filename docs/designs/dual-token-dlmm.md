@@ -32,9 +32,13 @@ Add an optional autonomous dual-token deployment mode to Meridian's existing Met
 ## Failure handling
 
 - Reject stale/malformed candles, missing quotes, unsupported token programs, invalid decimals, active-bin drift, unavailable bin arrays, excessive costs/slippage, insufficient transaction/rent reserve, and zero-sided allocations before swaps.
-- Use one swap at a time and persist its signature and observed balance delta before moving to the next phase.
-- After any timeout or ambiguous response, query signature status and wallet/position state before retrying. Never infer failure solely from a client timeout.
-- If only one swap completes, persist the acquired asset and automatically resume or convert it back to SOL within configured limits. Keep `recovery_pending` and retry on later cycles if the route is unavailable.
+- Use one swap at a time and persist the prepared signature before sending. Persist Jupiter's reported execute signature separately when it differs; reconcile both signatures and never resubmit or roll back while either can still land.
+- Attribute acquired and spent tokens from the confirmed transaction's owner and mint balance deltas. Do not infer operation-owned amounts from total wallet balance or subtract a wallet-wide baseline. This protects pre-existing USDC and tokens changed by unrelated transactions.
+- Record each confirmed token delta and the operation's acquired-token ledger in one durable journal update. A restart must be able to reconstruct the same remaining amount from confirmed acquisition and rollback transactions without applying a delta twice.
+- After any timeout or ambiguous response, query every candidate signature and the position account before retrying. Never infer failure solely from a client timeout or Jupiter status.
+- If only one swap completes, persist only that transaction's exact acquired amount and convert that amount back to SOL within configured limits. Keep `recovery_pending` and retry on later cycles if the route is unavailable.
+- If RPC cannot return token-balance deltas, a confirmed signature disagrees with its transaction, or confirmed rollback spends exceed the recorded acquisition, stop recovery and request manual reconciliation. Never deploy, sell existing wallet balances, or mark the operation cancelled while attribution is incomplete.
+- Telegram must distinguish a recovered abort (operation-owned tokens returned to SOL) from a recovery that is still pending. Include the operation ID when pending and tell the operator not to manually move those assets until reconciliation finishes.
 - If add-liquidity fails, confirm whether the position account exists. Close an empty position to recover rent when safe, then recover both tokens. Track unrecoverable/shared bin-array rent separately from position rent.
 - During exit, retain the open/recovery record until liquidity removal, both token swaps, account cleanup, and balance reconciliation complete.
 
