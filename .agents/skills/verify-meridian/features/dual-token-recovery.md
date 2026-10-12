@@ -17,6 +17,7 @@ Dual-token deployment converts a SOL budget into both DLMM pool tokens, then add
 - `dual-rent-basis` uses the actual position account lamports for paid and recoverable rent; the SDK quote is only a reserve estimate.
 - `dual-missing-deposits` leaves PnL unavailable until Meteora supplies a valid deposit basis.
 - `dual-position-discovery` checks the position account directly before closing local state when an SDK or portfolio listing omits it.
+- `dual-manual-exit-clearance` closes a pending exit journal after an external swap only when the position account is absent, every journaled remaining token has zero wallet balance, and no bot exit transaction exists. Manual SOL proceeds and net PnL remain unverified.
 
 ## How to get to it (user POV)
 
@@ -39,6 +40,7 @@ Preconditions:
 - **Test STRK-USDC valuation.** Run `node --test test/pnl-token-valuation.test.js`. It checks that USDC is priced as USDC, an SOL-quote pair still uses SOL, and an unpriced held token cannot produce a position value. The live manager trigger remains unverified without its VPS decision log.
 - **Test rent and deposit guards.** Run `node --test test/pnl-dual-rent.test.js`. A missing deposit basis or unreadable position rent must leave net PnL and its percentage unavailable. Actual position rent must override the SDK reserve estimate, and recoverable lamports must remain an asset while open.
 - **Test missing position discovery.** Run `node --test test/position-discovery.test.js`. An empty portfolio listing cannot close a position while its account exists or RPC lookup is inconclusive.
+- **Test manual exit clearance.** Run `node --test test/dual-exit-reconciliation.test.js`. A zero token balance clears the pending journal only after direct position-account verification. Nonzero balances, pending bot transactions, and RPC errors must leave it pending. The test does not prove the amount of SOL received by a manual swap.
 - **Test Telegram report.** Run the screening report suite from Doctor and inspect that `DEPLOY RECOVERY` differentiates recovered from pending state. This validates formatting logic, not delivery to a live Telegram chat.
 - **Test range coverage.** Run `node --test test/range-coverage.test.js test/screening-report.test.js`. Both normal and reconciled deploy results should derive downside/upside coverage from persisted bin prices; a legacy plan without enough prices reports unavailable coverage without blocking reconciliation.
 - **Live recovery proof.** Only in the isolated environment, capture both signatures, confirmed transaction deltas, position/rent state, and the final report. Verify existing token inventory before and after. If the signature or owner/mint delta cannot be verified, Meridian must remain pending; do not mark it recovered.
@@ -52,3 +54,4 @@ Preconditions:
 - A simulation error can arrive after a liquidity transaction lands. Check the journal and confirmed position before interpreting a failure report; a reconciled deployment must return success.
 - Do not treat a missing Meteora deposit record as zero cost basis or an estimated rent reserve as spent capital.
 - Never manually move assets while a recovery is pending; it can invalidate operation attribution.
+- If an operator has already swapped the remaining tokens manually, do not edit `dual-operations.json`. The next position refresh can mark the exit externally cleared when the position account is absent and all remaining token balances are zero. It records that SOL proceeds were not verified; a nonzero token balance still requires manual review.

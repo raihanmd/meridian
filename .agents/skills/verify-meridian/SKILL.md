@@ -30,7 +30,7 @@ test "$(git rev-parse --show-toplevel)" = "$PWD"
 node --version
 test -d node_modules
 npm test
-node --test test/dual-deploy.test.js test/dual-operations.test.js test/dual-ta.test.js test/dual-token-policy.test.js test/pnl-dual-rent.test.js test/pnl-token-valuation.test.js test/position-discovery.test.js test/screening-report.test.js test/range-coverage.test.js test/chart-indicators.test.js test/management-decision.test.js test/pool-memory-reason.test.js
+node --test test/dual-deploy.test.js test/dual-operations.test.js test/dual-exit-reconciliation.test.js test/dual-ta.test.js test/dual-token-policy.test.js test/pnl-dual-rent.test.js test/pnl-token-valuation.test.js test/position-discovery.test.js test/screening-report.test.js test/range-coverage.test.js test/chart-indicators.test.js test/management-decision.test.js test/pool-memory-reason.test.js
 git diff --check
 ```
 
@@ -63,7 +63,7 @@ If you started a development bot, stop that exact terminal process with Ctrl-C. 
 ## Helpers
 
 - `.agents/skills/verify-meridian/scripts/verify-cli-help.sh` runs the isolated CLI proof and checks the captured output and generated user help file. Invoke it from the repository root.
-- The recovery suite is `node --test test/dual-deploy.test.js test/dual-operations.test.js`. It covers wallet inventory preservation, partial swaps, mismatched signatures, exact deltas, rollback limits, missing evidence, and durable journal updates.
+- The recovery suite is `node --test test/dual-deploy.test.js test/dual-operations.test.js test/dual-exit-reconciliation.test.js`. It covers wallet inventory preservation, partial swaps, mismatched signatures, exact deltas, rollback limits, missing evidence, durable journal updates, and zero-balance manual exit clearance.
 
 ## Feature map
 

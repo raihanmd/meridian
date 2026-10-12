@@ -49,6 +49,7 @@ import {
   validateSwapOutcome,
 } from "./dual-deploy.js";
 import { dualOperationJournal } from "./dual-operations.js";
+import { reconcileExternallySettledDualExit } from "./dual-exit-reconciliation.js";
 
 // ─── Lazy SDK loader ───────────────────────────────────────────
 // @meteora-ag/dlmm → @coral-xyz/anchor uses CJS directory imports
@@ -825,6 +826,14 @@ async function executeOrResumeDualExit({ positionAddress, poolAddress, wallet, a
     if (operation.stage === "completed") return operation;
     if (operation.stage === "cancelled") throw new Error("Dual exit was already cancelled; manual reconciliation is required");
 
+    const externallySettled = await reconcileExternallySettledDualExit({
+      journal: dualOperationJournal,
+      operation,
+      readPositionAccount: (address) => getConnection().getAccountInfo(new PublicKey(address), "confirmed"),
+      readMintBalance: (owner, mint) => getMintBalanceRaw(new PublicKey(owner), mint),
+    });
+    if (externallySettled) return externallySettled;
+
     const applyConfirmedExitSwap = async (transaction, result) => {
       const expected = transaction.metadata?.amountRaw;
       const minimum = transaction.metadata?.minAmountOut;
@@ -966,6 +975,8 @@ async function reconcilePendingDualExits(wallet = getWallet()) {
       });
       if (result.stage !== "completed") {
         log("dual_exit_pending", `Exit ${operation.positionAddress.slice(0, 8)} remains pending: ${result.error || "one or more token swaps need retry"}`);
+      } else if (result.externalSettlement) {
+        log("dual_exit_external", `Exit ${operation.positionAddress.slice(0, 8)} cleared: position absent and wallet token balance zero; manual SOL proceeds and net PnL remain unverified`);
       }
     } catch (error) {
       log("dual_exit_warn", `Could not resume exit ${operation.positionAddress.slice(0, 8)}: ${error.message}`);
@@ -2638,7 +2649,7 @@ export async function closePosition({ position_address, reason }) {
           else closeTransactionFeesSol += feeSol;
         }
         if (persistedExit && sumRecordedDualTransactionFees(persistedExit) == null) closeFeeAccountingComplete = false;
-        if (closeFeeAccountingComplete && rentPaidSol != null && positionRentRecoveredSol != null) dualPnl = computeDualPnl({
+        if (closeFeeAccountingComplete && !persistedExit?.externalSettlement && rentPaidSol != null && positionRentRecoveredSol != null) dualPnl = computeDualPnl({
           rawPnlSol: result.dual_raw_pnl_sol,
           depositsSol: result.dual_deposits_sol,
           budgetSol: tracked.dual_deploy.amount_sol,
@@ -2653,7 +2664,9 @@ export async function closePosition({ position_address, reason }) {
         dual_token: true,
         auto_swap_assets: remainingExitAssets,
         auto_swap_complete: persistedExit?.stage === "completed" || assets.length === 0,
-        auto_swap_note: assets.length === 0
+        auto_swap_note: persistedExit?.externalSettlement
+          ? "Position account is closed and the withdrawn token balance is zero. The token was moved outside Meridian; manual SOL proceeds and net PnL are unverified."
+          : assets.length === 0
           ? "No non-SOL token balance was recovered from the pool."
           : persistedExit?.stage === "completed"
             ? `Both pool tokens converted to SOL; received ${(Number(BigInt(persistedExit.solReceivedLamports || "0")) / 1e9).toFixed(6)} SOL.`
