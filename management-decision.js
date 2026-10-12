@@ -9,6 +9,19 @@ export function isLowYieldEligible(position, managementConfig) {
     && position.fee_per_tvl_24h < managementConfig.minFeePerTvl24h;
 }
 
+export function canHoldAboveTakeProfit(position, managementConfig, tracked = null) {
+  if (managementConfig.holdAtTakeProfitWithFees === false || !managementConfig.trailingTakeProfit
+    || tracked?.trailing_active !== true || position.in_range !== true
+    || position.pnl_pct_suspicious || !Number.isFinite(position.pnl_pct)
+    || !Number.isFinite(position.fee_per_tvl_24h)
+    || !Number.isFinite(managementConfig.minFeePerTvl24h)
+    || position.fee_per_tvl_24h < managementConfig.minFeePerTvl24h) return false;
+  const feeX = position.unclaimed_fee_x_raw;
+  const feeY = position.unclaimed_fee_y_raw;
+  if (!/^\d+$/.test(String(feeX ?? "")) || !/^\d+$/.test(String(feeY ?? ""))) return false;
+  return BigInt(feeX) > 0n || BigInt(feeY) > 0n;
+}
+
 function validPnl(position, tracked) {
   if (position.pnl_pct_suspicious || position.pnl_pct == null) return null;
   if (position.pnl_pct <= -90 && tracked?.amount_sol && (position.total_value_usd ?? 0) > 0.01) {
@@ -23,7 +36,8 @@ export function getDeterministicCloseRule(position, managementConfig, tracked = 
   if (pnl != null && pnl <= managementConfig.stopLossPct) {
     return { action: "CLOSE", rule: 1, reason: "stop loss" };
   }
-  if (pnl != null && pnl >= managementConfig.takeProfitPct) {
+  if (pnl != null && pnl >= managementConfig.takeProfitPct
+    && !canHoldAboveTakeProfit(position, managementConfig, tracked)) {
     return { action: "CLOSE", rule: 2, reason: "take profit" };
   }
   if (position.active_bin != null && position.upper_bin != null
@@ -49,7 +63,9 @@ export function formatStayReason(position, managementConfig, tracked = null) {
   const minAge = managementConfig.minAgeBeforeYieldCheck ?? 60;
   const reasons = [pnl == null
     ? "PnL unavailable/suspect; TP and SL paused"
-    : `PnL ${pnl}% between SL ${managementConfig.stopLossPct}% and TP ${managementConfig.takeProfitPct}%`];
+    : pnl >= managementConfig.takeProfitPct
+      ? `PnL ${pnl}% >= TP ${managementConfig.takeProfitPct}%; HOLD while in range with verified unclaimed LP fees and rolling fee/TVL ${position.fee_per_tvl_24h}% >= ${managementConfig.minFeePerTvl24h}%`
+      : `PnL ${pnl}% between SL ${managementConfig.stopLossPct}% and TP ${managementConfig.takeProfitPct}%`];
   if (managementConfig.trailingTakeProfit) {
     reasons.push(tracked?.trailing_active
       ? `trailing active (confirmed peak ${tracked.peak_pnl_pct ?? "?"}%, drop trigger ${managementConfig.trailingDropPct} points)`

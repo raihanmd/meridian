@@ -12,7 +12,7 @@ const builder = source.slice(source.indexOf("function buildPosition("), source.i
 assert.ok(helpers.includes("function round("));
 assert.ok(builder.includes("function buildPosition("));
 
-function report({ depositsSol = 0.5, positionRentSol = 0.02, rentPaidSol = 0.02, rentEstimateSol = 0.2, ataBudgetSol = 0.1 } = {}) {
+function report({ depositsSol = 0.5, positionRentSol = 0.02, rentPaidSol = 0.02, rentEstimateSol = 0.2, ataBudgetSol = 0.1, feeXRaw = "0", feeYRaw = "0" } = {}) {
   const tracked = {
     dual_token: true,
     dual_deploy: {
@@ -36,7 +36,7 @@ function report({ depositsSol = 0.5, positionRentSol = 0.02, rentPaidSol = 0.02,
   const buildPosition = vm.runInNewContext(`${helpers}\n${builder}\nbuildPosition`, context);
   const position = {
     position: "position-address", pool: "pool-address", baseMint: "token-x", quoteMint: "token-y",
-    decX: 9, decY: 9, xRaw: "5000000000", yRaw: "0", feeXRaw: "0", feeYRaw: "0",
+    decX: 9, decY: 9, xRaw: "5000000000", yRaw: "0", feeXRaw, feeYRaw,
     active: 10, lower: 0, upper: 20,
   };
   const meteora = {
@@ -65,6 +65,12 @@ test("dual report uses actual position rent instead of quote estimate or ATA res
   assert.equal(position.pnl_pct, -4.04);
   assert.equal(position.pnl_true_usd, -2.1);
   assert.equal(position.pnl_pct_suspicious, false);
+});
+
+test("position report preserves raw on-chain fee balances for the TP hold guard", () => {
+  const position = report({ feeXRaw: "12345678901234567890" });
+  assert.equal(position.unclaimed_fee_x_raw, "12345678901234567890");
+  assert.equal(position.unclaimed_fee_y_raw, "0");
 });
 
 test("dual report uses current account rent as basis when historical paid rent is unavailable", () => {

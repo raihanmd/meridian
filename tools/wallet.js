@@ -319,7 +319,9 @@ export async function swapToken({
 
     const order = await orderRes.json();
     if (order.errorCode || order.errorMessage) {
-      throw new Error(`Swap V2 order error: ${order.errorMessage || order.errorCode}`);
+      const code = order.errorCode == null ? "" : ` (code ${order.errorCode})`;
+      const router = order.router == null ? "" : ` [router ${String(order.router).slice(0, 40)}]`;
+      throw new Error(`Swap V2 order error: ${order.errorMessage || "unknown"}${code}${router}`);
     }
 
     const { transaction: unsignedTx, requestId } = order;

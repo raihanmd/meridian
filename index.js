@@ -8,7 +8,7 @@ import { log } from "./logger.js";
 import { getMyPositions, closePosition, getActiveBin } from "./tools/dlmm.js";
 import { getWalletBalances } from "./tools/wallet.js";
 import { discoverPools, getTopCandidates } from "./tools/screening.js";
-import { formatAllowlistedPoolDiagnostics, formatConfirmedDeploy, formatDryRunDeploy } from "./screening-report.js";
+import { formatAllowlistedPoolDiagnostics, formatConfirmedDeploy, formatDeployFailureNotice, formatDeployRecoveryNotice, formatDryRunDeploy } from "./screening-report.js";
 import { getDualPoolRestrictionReason, getPoolAllowlistDisplay, getPoolRestrictionReason } from "./token-allowlist.js";
 import { DEFAULT_RESEARCH_DIR, enqueueResearchCandidates } from "./research/queue.js";
 import { startBackgroundResearchWorker } from "./research/worker.js";
@@ -681,6 +681,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
     let simulatedDeploy = null;
     let confirmedDeploy = null;
     let deployRecovery = null;
+    let deployFailure = null;
     const { content } = await agentLoop(`
 SCREENING CYCLE
 ${strategyWithContext}
@@ -745,6 +746,7 @@ STEPS:
 
    REJECTED
    <short flat list of top candidate names and why they were skipped>
+Do not infer the cause of an execution failure from a generic tool error. Quote the tool error and state that the cause is unverified when chain or wallet evidence is absent.
 IMPORTANT:
 - Keep the whole report compact and highly scannable for Telegram.
       `, config.llm.maxSteps, [], "SCREENER", config.llm.screeningModel, 2048, {
@@ -755,15 +757,17 @@ IMPORTANT:
         onToolFinish: async ({ name, result, success }) => {
           if (name === "deploy_position") {
             deployAttempted = true;
+            if (!success || result?.success === false || result?.error || result?.blocked) deployFailure = result;
             if (success && (result?.dry_run || result?.position) && result?.success !== false && !result?.error && !result?.blocked) {
               deploySucceeded = true;
               if (result?.dry_run) simulatedDeploy = result;
               else if (result?.position) confirmedDeploy = result;
             }
-            if (result?.recovery_pending || result?.recovered) {
+            if (result?.recovery_pending || result?.recovered || result?.externally_settled) {
               deployRecovery = {
                 pending: Boolean(result.recovery_pending),
                 recovered: Boolean(result.recovered),
+                externallySettled: Boolean(result.externally_settled),
                 operationId: result.operation_id || null,
               };
             }
@@ -808,10 +812,11 @@ IMPORTANT:
       screenReport = "⛔ NO DEPLOY\n\nThe agent reported a deploy, but no successful deploy_position result was recorded. Check bot logs.";
     }
     if (deployRecovery) {
-      const recoveryNotice = deployRecovery.recovered
-        ? "✅ Operasi dihentikan tanpa deploy. Tidak ada token hasil operasi tertinggal di luar SOL; saldo token sebelum operasi tidak ikut dipakai dalam pemulihan. Screening akan dimulai ulang pada siklus berikutnya."
-        : `⏳ Pemulihan masih berjalan${deployRecovery.operationId ? ` (${deployRecovery.operationId})` : ""}. Bot tidak deploy dan tidak akan memakai saldo token wallet sebagai bukti hasil swap. Hindari transaksi manual sampai rekonsiliasi selesai.`;
+      const recoveryNotice = formatDeployRecoveryNotice(deployRecovery);
       screenReport = `${screenReport}\n\nDEPLOY RECOVERY\n${recoveryNotice}`;
+    }
+    if (deployFailure && !deploySucceeded) {
+      screenReport = `${screenReport}\n\n${formatDeployFailureNotice(deployFailure)}`;
     }
     if (!simulatedDeploy && /⛔\s*NO DEPLOY/i.test(content)) {
       appendDecision({

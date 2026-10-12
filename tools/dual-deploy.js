@@ -81,6 +81,43 @@ export function getConfirmedOwnerMintDelta({ transaction, owner, mint }) {
   return (after - before).toString();
 }
 
+export function getConfirmedTokenAccountBalances({ transaction, owner, mint, tokenAccount }) {
+  if (!transaction?.meta || transaction.meta.err || !owner || !mint || !tokenAccount) return null;
+  const message = transaction.transaction?.message ?? transaction.message;
+  const keys = [
+    ...(message?.accountKeys ?? message?.staticAccountKeys ?? []),
+    ...(transaction.meta.loadedAddresses?.writable ?? []),
+    ...(transaction.meta.loadedAddresses?.readonly ?? []),
+  ].map((key) => String(key?.pubkey ?? key));
+  const accountIndex = keys.indexOf(tokenAccount);
+  if (accountIndex < 0) return null;
+  const read = (balances) => (balances || []).find((entry) =>
+    entry.accountIndex === accountIndex && entry.owner === owner && entry.mint === mint);
+  const after = read(transaction.meta.postTokenBalances);
+  if (!after) return null;
+  const before = read(transaction.meta.preTokenBalances);
+  return {
+    beforeRaw: String(before?.uiTokenAmount?.amount ?? "0"),
+    afterRaw: String(after.uiTokenAmount?.amount ?? "0"),
+  };
+}
+
+export function assessRollbackInventory({ operationOwnedRaw, associatedBalanceRaw, associatedBaselineRaw }) {
+  const owned = BigInt(operationOwnedRaw);
+  const balance = BigInt(associatedBalanceRaw);
+  if (owned < 0n || balance < 0n) throw new Error("Rollback token amounts cannot be negative");
+  if (owned === 0n) return { status: "empty", availableRaw: "0" };
+  if (balance === 0n) return { status: "zero_balance", availableRaw: "0" };
+  if (associatedBaselineRaw == null) return { status: "baseline_unverified", availableRaw: "0" };
+  const baseline = BigInt(associatedBaselineRaw);
+  if (baseline < 0n) throw new Error("Rollback token baseline cannot be negative");
+  const available = balance > baseline ? balance - baseline : 0n;
+  return {
+    status: available >= owned ? "ready" : "shortfall",
+    availableRaw: available.toString(),
+  };
+}
+
 export function confirmedTransactionHasSigner(transaction, owner) {
   const message = transaction?.transaction?.message ?? transaction?.message;
   const keys = message?.staticAccountKeys ?? message?.accountKeys;

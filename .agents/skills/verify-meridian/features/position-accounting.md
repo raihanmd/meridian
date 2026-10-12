@@ -8,6 +8,7 @@
 - `dual-net-pnl` values each mint at its own price and uses actual position rent. Missing deposit history, token prices, rent, or recorded transaction fees leaves PnL unavailable.
 - `manager-pnl-guard` does not act on stop-loss, take-profit, or trailing-profit rules from suspicious or missing PnL.
 - `manager-hold-reason` reports the current TP/SL gap, trailing status, range state, and low-yield age threshold from the same deterministic close rules used for action. Unknown age or yield pauses the low-yield exit.
+- `manager-tp-fee-hold` allows HOLD above TP only when trailing protection is active, the position is in range, Meteora's rolling fee/TVL meets the configured floor, and the live RPC position contains unclaimed fee tokens. Missing on-chain fee balances or a weak yield restores the ordinary TP close. Stop loss, confirmed trailing drop, and OOR exits keep priority.
 - `position-sync` requires direct account absence before state marks a position closed after its indexing grace period.
 - `dual-exit` claims, removes liquidity, closes the position, and swaps operation-owned non-SOL output to SOL. Dual-token exit does not use the LPAgent zap-out relay.
 

@@ -8,6 +8,22 @@ function price(value) {
   return value == null || !Number.isFinite(number) ? "?" : number.toPrecision(7);
 }
 
+export function formatDeployRecoveryNotice(recovery) {
+  if (recovery.externallySettled) {
+    return "⚠️ Operasi ditutup setelah posisi tidak ada dan saldo token hasil operasi nol. Penyelesaian dilakukan di luar bot; jumlah SOL yang diterima dan PnL belum terverifikasi.";
+  }
+  if (recovery.recovered) {
+    return "✅ Operasi dihentikan tanpa deploy. Tidak ada token hasil operasi tertinggal di luar SOL; saldo token sebelum operasi tidak ikut dipakai dalam pemulihan. Screening akan dimulai ulang pada siklus berikutnya.";
+  }
+  return `⏳ Pemulihan masih berjalan${recovery.operationId ? ` (${recovery.operationId})` : ""}. Bot tidak deploy dan tidak akan memakai saldo token wallet sebagai bukti hasil swap. Hindari transaksi manual sampai rekonsiliasi selesai.`;
+}
+
+export function formatDeployFailureNotice(failure) {
+  const detail = String(failure?.error || "Deploy tool returned no confirmed position")
+    .replace(/\s+/g, " ").trim().slice(0, 600);
+  return `DEPLOY ERROR (tool)\n${detail}\nPenyebab belum terverifikasi sampai transaksi dan saldo wallet direkonsiliasi.`;
+}
+
 export function formatEntryEvidence(ta, indicator) {
   const lines = [];
   if (ta?.eligible) {

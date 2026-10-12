@@ -1,6 +1,20 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { formatAllowlistedPoolDiagnostics, formatConfirmedDeploy, formatDryRunDeploy, formatEntryEvidence } from "../screening-report.js";
+import { formatAllowlistedPoolDiagnostics, formatConfirmedDeploy, formatDeployFailureNotice, formatDeployRecoveryNotice, formatDryRunDeploy, formatEntryEvidence } from "../screening-report.js";
+
+test("external deploy settlement is not reported as a verified SOL rollback", () => {
+  const text = formatDeployRecoveryNotice({ externallySettled: true, recovered: false });
+  assert.match(text, /jumlah SOL yang diterima dan PnL belum terverifikasi/);
+  assert.doesNotMatch(text, /✅/);
+  assert.match(formatDeployRecoveryNotice({ recovered: true }), /Tidak ada token hasil operasi tertinggal/);
+});
+
+test("failed deploy report preserves tool evidence without guessing which balance was insufficient", () => {
+  const text = formatDeployFailureNotice({ error: "Swap V2 order error: Insufficient funds (code 1)" });
+  assert.match(text, /code 1/);
+  assert.match(text, /Penyebab belum terverifikasi/);
+  assert.doesNotMatch(text, /SOL buffer/);
+});
 
 test("simulated deploy report names the selected pool without claiming a live position", () => {
   const text = formatDryRunDeploy({

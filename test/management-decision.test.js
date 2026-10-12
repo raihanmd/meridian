@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { formatStayReason, getDeterministicCloseRule, isLowYieldEligible } from "../management-decision.js";
+import { canHoldAboveTakeProfit, formatStayReason, getDeterministicCloseRule, isLowYieldEligible } from "../management-decision.js";
 
 const config = {
   stopLossPct: -10,
@@ -45,4 +45,28 @@ test("range and trailing status remain visible without inventing an exit", () =>
   assert.match(formatStayReason(nearOor, config, { trailing_active: true, peak_pnl_pct: 3.5 }), /trailing active/);
   assert.equal(getDeterministicCloseRule({ ...nearOor, minutes_out_of_range: 30 }, config)?.rule, 4);
   assert.equal(getDeterministicCloseRule({ ...nearOor, active_bin: -874 }, config)?.rule, 3);
+});
+
+test("TP can remain in range only with trailing protection, strong yield and actual LP fee tokens", () => {
+  const profitable = {
+    ...position, pnl_pct: 5.4, age_minutes: 130, fee_per_tvl_24h: 3.2,
+    unclaimed_fee_x_raw: "1", unclaimed_fee_y_raw: "0",
+  };
+  const tracked = { trailing_active: true, peak_pnl_pct: 5.4 };
+  assert.equal(canHoldAboveTakeProfit(profitable, config, tracked), true);
+  assert.equal(getDeterministicCloseRule(profitable, config, tracked), null);
+  assert.match(formatStayReason(profitable, config, tracked), /HOLD while in range/);
+  const closeCases = [
+    { position: { ...profitable, in_range: false }, tracked },
+    { position: { ...profitable, fee_per_tvl_24h: 2.99 }, tracked },
+    { position: { ...profitable, unclaimed_fee_x_raw: "0" }, tracked },
+    { position: { ...profitable, unclaimed_fee_x_raw: null }, tracked },
+    { position: { ...profitable, pnl_pct_suspicious: false }, tracked: null },
+  ];
+  for (const entry of closeCases) {
+    assert.equal(getDeterministicCloseRule(entry.position, config, entry.tracked)?.rule, 2);
+  }
+  assert.equal(getDeterministicCloseRule(profitable, { ...config, holdAtTakeProfitWithFees: false }, tracked)?.rule, 2);
+  assert.equal(getDeterministicCloseRule(profitable, { ...config, trailingTakeProfit: false }, tracked)?.rule, 2);
+  assert.equal(getDeterministicCloseRule({ ...profitable, pnl_pct: -10.1 }, config, tracked)?.rule, 1);
 });

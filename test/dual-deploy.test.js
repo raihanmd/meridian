@@ -2,11 +2,13 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   addOperationTokenDelta,
+  assessRollbackInventory,
   buildDualDeployPlan,
   calculateOperationOwnedAmounts,
   computeDualPnl,
   confirmedTransactionHasSigner,
   getConfirmedOwnerMintDelta,
+  getConfirmedTokenAccountBalances,
   hasUnresolvedSwapTransactions,
   validatePreparedDualSwapQuote,
   validateSwapOutcome,
@@ -130,6 +132,46 @@ test("attributes ATA creation, account closure, and multiple owned token account
     },
   };
   assert.equal(getConfirmedOwnerMintDelta({ transaction, owner: "wallet", mint: "STRK" }), "17");
+});
+
+test("reads the pre-swap ATA balance from confirmed transaction evidence", () => {
+  const transaction = {
+    transaction: { message: { accountKeys: ["wallet", "other-account", "token-ata"] } },
+    meta: {
+      err: null,
+      preTokenBalances: [
+        { accountIndex: 2, owner: "wallet", mint: X, uiTokenAmount: { amount: "14" } },
+      ],
+      postTokenBalances: [
+        { accountIndex: 2, owner: "wallet", mint: X, uiTokenAmount: { amount: "4330950741" } },
+      ],
+    },
+  };
+  assert.deepEqual(getConfirmedTokenAccountBalances({ transaction, owner: "wallet", mint: X, tokenAccount: "token-ata" }), {
+    beforeRaw: "14", afterRaw: "4330950741",
+  });
+  assert.equal(getConfirmedTokenAccountBalances({ transaction, owner: "wallet", mint: X, tokenAccount: "other-account" }), null);
+  assert.equal(getConfirmedTokenAccountBalances({ transaction, owner: "other", mint: X, tokenAccount: "token-ata" }), null);
+});
+
+test("rolls back only when the ATA retains the full journal-owned amount above its original inventory", () => {
+  const owned = "4330950727";
+  assert.deepEqual(assessRollbackInventory({ operationOwnedRaw: owned, associatedBalanceRaw: "4330950741", associatedBaselineRaw: "14" }), {
+    status: "ready", availableRaw: owned,
+  });
+  assert.deepEqual(assessRollbackInventory({ operationOwnedRaw: owned, associatedBalanceRaw: "7", associatedBaselineRaw: "14" }), {
+    status: "shortfall", availableRaw: "0",
+  });
+  assert.deepEqual(assessRollbackInventory({ operationOwnedRaw: owned, associatedBalanceRaw: "200", associatedBaselineRaw: "14" }), {
+    status: "shortfall", availableRaw: "186",
+  });
+  assert.deepEqual(assessRollbackInventory({ operationOwnedRaw: owned, associatedBalanceRaw: "0", associatedBaselineRaw: "14" }), {
+    status: "zero_balance", availableRaw: "0",
+  });
+  assert.deepEqual(assessRollbackInventory({ operationOwnedRaw: owned, associatedBalanceRaw: "4330950741", associatedBaselineRaw: null }), {
+    status: "baseline_unverified", availableRaw: "0",
+  });
+  assert.throws(() => assessRollbackInventory({ operationOwnedRaw: "-1", associatedBalanceRaw: "0", associatedBaselineRaw: "0" }), /cannot be negative/);
 });
 
 test("only confirmed operation-owned swaps and rollbacks determine recovery amounts", () => {

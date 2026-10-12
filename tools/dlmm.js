@@ -32,23 +32,26 @@ import { appendDecision } from "../decision-log.js";
 import { agentMeridianJson, getAgentIdForRequests, getAgentMeridianHeaders } from "./agent-meridian.js";
 import { getAndClearStagedSignals } from "../signal-tracker.js";
 import { computePositions, fetchDlmmPnlForPool, getSolUsdPrice } from "./pnl.js";
-import { verifyMissingPositions } from "./position-discovery.js";
+import { findPoolForPositionInSdkMap, verifyMissingPositions } from "./position-discovery.js";
 import { getDualPoolRestrictionReason, getPoolRestrictionReason } from "../token-allowlist.js";
 import { analyzeDualTokenRange, fetchDualTokenOhlcv } from "./dual-ta.js";
 import { computePriceRangeCoverage } from "../range-coverage.js";
 import {
   addOperationTokenDelta,
+  assessRollbackInventory,
   buildDualDeployPlan,
   calculateOperationOwnedAmounts,
   confirmedTransactionHasSigner,
   computeDualPnl,
   computeDualValueSplit,
   getConfirmedOwnerMintDelta,
+  getConfirmedTokenAccountBalances,
   hasUnresolvedSwapTransactions,
   validatePreparedDualSwapQuote,
   validateSwapOutcome,
 } from "./dual-deploy.js";
 import { dualOperationJournal } from "./dual-operations.js";
+import { reconcileExternallySettledDualDeploy, walletDlmmPositionAddresses } from "./dual-deploy-reconciliation.js";
 import { reconcileExternallySettledDualExit } from "./dual-exit-reconciliation.js";
 
 // ─── Lazy SDK loader ───────────────────────────────────────────
@@ -374,14 +377,24 @@ async function assertRangeDoesNotRequireBinArrayInitialization(pool, minBinId, m
 
 async function getMintBalanceRaw(owner, mint) {
   if (mint === config.tokens.SOL) return (await getConnection().getBalance(owner, "confirmed")).toString();
-  const mintAccount = await getConnection().getAccountInfo(new PublicKey(mint), "confirmed");
+  return (await getMintInventoryRaw(owner, mint)).totalRaw;
+}
+
+async function getMintInventoryRaw(owner, mint, commitment = "confirmed") {
+  const mintAccount = await getConnection().getAccountInfo(new PublicKey(mint), commitment);
   if (!mintAccount) throw new Error(`Token mint ${mint} does not exist`);
-  const accounts = await getConnection().getParsedTokenAccountsByOwner(owner, { programId: mintAccount.owner }, "confirmed");
-  return accounts.value.reduce((total, account) => {
+  const accounts = await getConnection().getParsedTokenAccountsByOwner(owner, { programId: mintAccount.owner }, commitment);
+  const associatedAddress = getAssociatedTokenAddressSync(new PublicKey(mint), owner, false, mintAccount.owner).toString();
+  let totalRaw = 0n;
+  let associatedRaw = 0n;
+  for (const account of accounts.value) {
     const info = account.account.data?.parsed?.info;
-    if (info?.mint !== mint) return total;
-    return total + BigInt(info?.tokenAmount?.amount || "0");
-  }, 0n).toString();
+    if (info?.mint !== mint) continue;
+    const amount = BigInt(info?.tokenAmount?.amount || "0");
+    totalRaw += amount;
+    if (account.pubkey.toString() === associatedAddress) associatedRaw += amount;
+  }
+  return { totalRaw: totalRaw.toString(), associatedRaw: associatedRaw.toString(), associatedAddress };
 }
 
 async function readSignatureStatus(signature) {
@@ -417,6 +430,35 @@ function dualTransactionMint(operation, transaction) {
   const isRollback = transaction.metadata?.role === "rollback" || transaction.kind.startsWith("rollback_");
   return (isRollback ? transaction.metadata?.input_mint : transaction.metadata?.output_mint)
     ?? (side === "x" ? operation.plan.token_x_mint : operation.plan.token_y_mint);
+}
+
+async function getRollbackAssociatedBaselineRaw(operation, side, mint, associatedAddress, walletAddress) {
+  const acquisitions = (operation.transactions || []).filter((entry) =>
+    entry.status === "confirmed" && entry.kind.startsWith(`swap_${side}`));
+  if (acquisitions.length !== 1) return null;
+  const acquisition = acquisitions[0];
+  if (acquisition.metadata?.preAssociatedBalanceRaw != null) {
+    return String(acquisition.metadata.preAssociatedBalanceRaw);
+  }
+  const confirmedTx = await getConfirmedTransaction(acquisition.signature);
+  if (!confirmedTx?.meta || confirmedTx.meta.err || !confirmedTransactionHasSigner(confirmedTx, walletAddress)) return null;
+  const balances = getConfirmedTokenAccountBalances({
+    transaction: confirmedTx, owner: walletAddress, mint, tokenAccount: associatedAddress,
+  });
+  if (!balances) return null;
+  const delta = BigInt(balances.afterRaw) - BigInt(balances.beforeRaw);
+  if (delta !== BigInt(acquisition.metadata?.outputDeltaRaw ?? "0")) return null;
+  await dualOperationJournal.recordTransaction(operation.id, {
+    ...acquisition,
+    metadata: { ...acquisition.metadata, preAssociatedBalanceRaw: balances.beforeRaw },
+  });
+  return balances.beforeRaw;
+}
+
+async function listWalletDlmmPositions(owner) {
+  const { DLMM } = await getDLMM();
+  const all = await DLMM.getAllLbPairPositionsByUser(getConnection(), new PublicKey(owner));
+  return walletDlmmPositionAddresses(all);
 }
 
 async function recordJupiterExecutionResponse(operationId, transaction, response) {
@@ -732,12 +774,58 @@ async function reconcileDualOperation(operation, pool, wallet) {
   }
 
   operation = await dualOperationJournal.get(operation.id);
+  try {
+    const external = await reconcileExternallySettledDualDeploy({
+      journal: dualOperationJournal,
+      operation,
+      solMint: config.tokens.SOL,
+      readPositionAccount: (address) => getConnection().getAccountInfo(new PublicKey(address), "finalized"),
+      readMintInventory: (owner, mint) => getMintInventoryRaw(new PublicKey(owner), mint, "finalized"),
+      readSignatureStatus,
+      readBlockHeight: () => getConnection().getBlockHeight("finalized"),
+      listWalletPositions: listWalletDlmmPositions,
+    });
+    if (external) {
+      return {
+        success: false,
+        recovery_pending: false,
+        externally_settled: true,
+        operation_id: operation.id,
+        error: "Operation tokens are absent from the wallet and no wallet DLMM position remains. External settlement is recorded; SOL proceeds and PnL are unverified.",
+      };
+    }
+  } catch (error) {
+    await dualOperationJournal.transition(operation.id, "recovery_pending", {
+      recoveryError: `External settlement checks could not complete: ${error.message}`,
+    });
+    return { success: false, recovery_pending: true, operation_id: operation.id, error: `External settlement checks could not complete: ${error.message}` };
+  }
   const acquiredRaw = { x: "0", y: "0", ...(operation.acquiredRaw || {}) };
   for (const side of ["x", "y"]) {
     const amountRaw = BigInt(acquiredRaw[side] || "0");
     const mint = side === "x" ? operation.plan.token_x_mint : operation.plan.token_y_mint;
     if (amountRaw <= 0n || mint === config.tokens.SOL) continue;
     try {
+      const inventory = await getMintInventoryRaw(wallet.publicKey, mint);
+      const baselineRaw = await getRollbackAssociatedBaselineRaw(
+        operation, side, mint, inventory.associatedAddress, wallet.publicKey.toString(),
+      );
+      const assessment = assessRollbackInventory({
+        operationOwnedRaw: amountRaw.toString(),
+        associatedBalanceRaw: inventory.associatedRaw,
+        associatedBaselineRaw: baselineRaw,
+      });
+      if (assessment.status !== "ready") {
+        const walletPositions = await listWalletDlmmPositions(wallet.publicKey.toString()).catch(() => null);
+        throw new Error(
+          `Rollback ${side.toUpperCase()} paused: journal owns ${amountRaw} raw ${mint}, ` +
+          `wallet ATA has ${inventory.associatedRaw} (all wallet token accounts: ${inventory.totalRaw}; ` +
+          `pre-acquisition ATA balance: ${baselineRaw ?? "unverified"}). ` +
+          `Status: ${assessment.status}. The missing tokens may be in a different LP or transaction; ` +
+          `${walletPositions === null ? "wallet DLMM position scan unavailable. " : `wallet DLMM positions: ${walletPositions.join(", ") || "none"}. `}` +
+          `inspect on-chain activity before clearing this operation. No wallet inventory was swapped.`,
+        );
+      }
       const info = await getConnection().getParsedAccountInfo(new PublicKey(mint), "confirmed");
       const decimals = info.value?.data?.parsed?.info?.decimals;
       if (!Number.isInteger(decimals)) throw new Error("Token decimals are unavailable");
@@ -790,8 +878,19 @@ async function reconcileDualOperation(operation, pool, wallet) {
         operationPatch: { acquiredRaw: { ...acquiredRaw } },
       });
     } catch (error) {
-      await dualOperationJournal.transition(operation.id, "recovery_pending", { acquiredRaw: { ...acquiredRaw }, recoveryError: error.message });
-      return { success: false, recovery_pending: true, operation_id: operation.id, error: error.message };
+      let detail = error.message;
+      if (/Insufficient funds/i.test(detail)) {
+        try {
+          const latestInventory = await getMintInventoryRaw(wallet.publicKey, mint);
+          detail += `; rollback ${side.toUpperCase()} journal amount ${amountRaw}, ` +
+            `wallet ATA balance ${latestInventory.associatedRaw}, total wallet mint balance ${latestInventory.totalRaw}. ` +
+            `Verify whether the remaining input balance or SOL transaction-fee budget is short; reconcile any signed rollback transaction before retrying.`;
+        } catch (balanceError) {
+          detail += `; current mint balance could not be verified: ${balanceError.message}`;
+        }
+      }
+      await dualOperationJournal.transition(operation.id, "recovery_pending", { acquiredRaw: { ...acquiredRaw }, recoveryError: detail });
+      return { success: false, recovery_pending: true, operation_id: operation.id, error: detail };
     }
   }
   const finalState = await dualOperationJournal.get(operation.id);
@@ -1186,7 +1285,25 @@ async function deployDualTokenPositionLocked(args) {
       if (BigInt(outputDeltaRaw) <= 0n) throw new Error("Confirmed Jupiter transaction did not produce an attributable output-token balance increase");
       acquiredRaw[swap.side] = addOperationTokenDelta(acquiredRaw[swap.side], outputDeltaRaw);
       const swapFeeSol = Number.isFinite(confirmedTx.meta.fee) ? confirmedTx.meta.fee / 1e9 : null;
-      const confirmedMetadata = { ...result, side: swap.side, role: "acquire", outputDeltaRaw, feeSol: swapFeeSol };
+      let preAssociatedBalanceRaw = null;
+      try {
+        const inventory = await getMintInventoryRaw(wallet.publicKey, swap.outputMint);
+        const balances = getConfirmedTokenAccountBalances({
+          transaction: confirmedTx,
+          owner: wallet.publicKey.toString(),
+          mint: swap.outputMint,
+          tokenAccount: inventory.associatedAddress,
+        });
+        if (balances && BigInt(balances.afterRaw) - BigInt(balances.beforeRaw) === BigInt(outputDeltaRaw)) {
+          preAssociatedBalanceRaw = balances.beforeRaw;
+        }
+      } catch (baselineError) {
+        log("dual_recovery_warn", `Could not persist pre-swap ATA baseline for ${result.tx}: ${baselineError.message}`);
+      }
+      const confirmedMetadata = {
+        ...result, side: swap.side, role: "acquire", outputDeltaRaw, feeSol: swapFeeSol,
+        ...(preAssociatedBalanceRaw != null ? { preAssociatedBalanceRaw } : {}),
+      };
       await dualOperationJournal.recordTransaction(operation.id, {
         kind: `swap_${swap.side}`,
         signature: result.tx,
@@ -1318,13 +1435,18 @@ async function deployDualTokenPositionLocked(args) {
         log("dual_recovery_pending", `Operation ${operation.id} awaits reconciliation: ${recoveryResult.error || error.message}`);
       } else if (recoveryResult?.recovered) {
         log("dual_recovery", `Operation ${operation.id} returned operation-owned assets to SOL; fresh screening is required`);
+      } else if (recoveryResult?.externally_settled) {
+        log("dual_recovery_external", `Operation ${operation.id} settled outside the journal; SOL proceeds and PnL are unverified`);
       }
     }
-    log("dual_deploy_error", `Operation ${operation.id} requires reconciliation: ${error.message}`);
+    if (!recoveryResult?.externally_settled) {
+      log("dual_deploy_error", `Operation ${operation.id} requires reconciliation: ${error.message}`);
+    }
     return {
       success: false,
       recovery_pending: recoveryResult?.recovery_pending ?? true,
       recovered: recoveryResult?.recovered ?? false,
+      externally_settled: recoveryResult?.externally_settled ?? false,
       operation_id: operation.id,
       error: recoveryResult?.recovered
         ? "Deployment was cancelled safely; no operation-owned pool tokens remain outside SOL. A fresh screening cycle is required."
@@ -3259,11 +3381,8 @@ async function lookupPoolForPosition(position_address, walletAddress) {
     new PublicKey(walletAddress)
   );
 
-  for (const [lbPairKey, positionData] of Object.entries(allPositions)) {
-    for (const pos of positionData.lbPairPositionsData || []) {
-      if (pos.publicKey.toString() === position_address) return lbPairKey;
-    }
-  }
+  const pool = findPoolForPositionInSdkMap(allPositions, position_address);
+  if (pool) return pool;
 
   throw new Error(`Position ${position_address} not found in open positions`);
 }

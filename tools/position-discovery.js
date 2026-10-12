@@ -14,3 +14,14 @@ export async function verifyMissingPositions(activeAddresses, trackedPositions, 
     unresolved: checked.filter((entry) => entry.status !== "absent").map((entry) => entry.position),
   };
 }
+
+export function findPoolForPositionInSdkMap(positionsByPool, positionAddress) {
+  if (!(positionsByPool instanceof Map)) throw new Error("DLMM position scan returned an unknown response shape");
+  for (const [poolAddress, entry] of positionsByPool) {
+    if (!Array.isArray(entry?.lbPairPositionsData)) throw new Error("DLMM position scan has an unknown pool entry");
+    if (entry.lbPairPositionsData.some((position) => position?.publicKey?.toString() === positionAddress)) {
+      return poolAddress.toString();
+    }
+  }
+  return null;
+}

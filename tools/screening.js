@@ -7,6 +7,8 @@ import { confirmIndicatorPreset } from "./chart-indicators.js";
 import { getAgentMeridianBase, getAgentMeridianHeaders } from "./agent-meridian.js";
 import { getDualPoolRestrictionReason, getPoolRestrictionReason } from "../token-allowlist.js";
 import { analyzeDualTokenRange, fetchDualTokenOhlcv } from "./dual-ta.js";
+import { Connection } from "@solana/web3.js";
+import { checkDualMintPrograms } from "./dual-mint-compatibility.js";
 
 const DATAPI_JUP = "https://datapi.jup.ag/v1";
 
@@ -610,8 +612,31 @@ export async function getTopCandidates({ limit = 10, discovery: providedDiscover
       }
       return true;
     })
-    .sort((a, b) => scoreCandidate(b) - scoreCandidate(a))
-    .slice(0, limit);
+    .sort((a, b) => scoreCandidate(b) - scoreCandidate(a));
+
+  if (config.strategy.dualToken.enabled && eligible.length > 0) {
+    const mints = eligible.flatMap((pool) => [pool.base?.mint, pool.quote?.mint]);
+    let mintReasons;
+    try {
+      if (!process.env.RPC_URL) throw new Error("RPC_URL is not configured");
+      mintReasons = await checkDualMintPrograms({
+        connection: new Connection(process.env.RPC_URL, "confirmed"),
+        mints,
+        solMint: config.tokens.SOL,
+      });
+    } catch (error) {
+      mintReasons = new Map(mints.filter((mint) => mint !== config.tokens.SOL)
+        .map((mint) => [mint, `mint program verification unavailable: ${error.message}`]));
+    }
+    const compatible = eligible.filter((pool) => {
+      const mint = [pool.base?.mint, pool.quote?.mint].find((address) => mintReasons.has(address));
+      if (!mint) return true;
+      pushFilteredReason(filteredOut, pool, `dual-token mint ${String(mint).slice(0, 8)}: ${mintReasons.get(mint)}`);
+      return false;
+    });
+    eligible.splice(0, eligible.length, ...compatible);
+  }
+  eligible.splice(limit);
 
   if (config.strategy.dualToken.enabled && eligible.length > 0) {
     const decisions = await Promise.all(eligible.map(async (pool) => {

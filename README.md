@@ -539,7 +539,8 @@ Hermes must be available to the same Linux user as Meridian. Its model and web c
 | `minSolToOpen` | `0.55` | Minimum wallet SOL before opening |
 | `outOfRangeWaitMinutes` | `30` | Minutes OOR before acting |
 | `stopLossPct` | `-15` | Close position if price drops by this % |
-| `takeProfitPct` | `5` | Close when fees earned reach this % of capital |
+| `takeProfitPct` | `5` | Net position PnL threshold for take profit; includes capital movement and LP fees |
+| `holdAtTakeProfitWithFees` | `true` | With trailing TP active, allow a position above TP to remain in range while rolling fee/TVL meets `minFeePerTvl24h` and on-chain unclaimed LP fees are nonzero; missing evidence closes at TP |
 | `trailingTakeProfit` | `true` | Enable trailing take-profit |
 | `trailingTriggerPct` | `3` | Activate trailing TP at this PnL % |
 | `trailingDropPct` | `1.5` | Close when PnL drops this % from peak |

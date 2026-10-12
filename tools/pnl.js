@@ -263,6 +263,8 @@ function buildPosition(f, prices, solUsd, meteora, solMode, positionRentSol) {
     in_range:           inRange,
     unclaimed_fees_usd: round(solMode ? claimableSol : claimableUsd),
     unclaimed_fees_true_usd: round(claimableUsd),
+    unclaimed_fee_x_raw: String(f.feeXRaw ?? "0"),
+    unclaimed_fee_y_raw: String(f.feeYRaw ?? "0"),
     total_value_usd:    round(solMode ? balancesSol : balancesUsd),
     total_value_true_usd: round(balancesUsd),
     collected_fees_usd: round(solMode ? claimedSol : claimedUsd),
