@@ -7,6 +7,7 @@ Dual-token deployment converts a SOL budget into both DLMM pool tokens, then add
 - `dual-plan` calculates token allocation, routes, range, reserve, and rent before transactions.
 - `dual-acquire` journals prepared and Jupiter-reported swap signatures.
 - `dual-partial-failure` recovers the exact confirmed output from a successful side when the other side fails.
+- `dual-global-recovery-gate` resumes every non-terminal deploy for the wallet before candidate discovery, regardless of pool, and repeats the check under the wallet-wide lock immediately before deploy. A still-pending operation or unavailable recovery evidence blocks the screening cycle.
 - `dual-signature-mismatch` waits for every candidate signature to become terminal before retrying or rolling back.
 - `dual-inventory-preservation` never counts pre-existing wallet balance as this operation's output.
 - `dual-rollback-balance` compares journal-owned token amount against the current associated token account above its pre-acquisition balance before requesting a rollback order. A deficit leaves recovery pending and reports the wallet balance.
@@ -41,6 +42,7 @@ Preconditions:
 - **Test BORDR inventory depletion.** Run `node --test test/dual-deploy.test.js test/dual-deploy-reconciliation.test.js`. The fixture models a 4,330,950,727 raw token acquisition over a 14 raw token ATA baseline, an ATA later reduced to 7 raw units, and a zero wallet balance that must not clear the journal while any wallet DLMM position remains. The tests do not submit a swap or prove SOL proceeds.
 - **Test changed Jupiter quotes.** The dual-deploy suite checks a refreshed order against its own minimum and price-impact cap. Run `node --test test/jupiter-wallet-amounts.test.js` to check wallet settlement amounts when Jupiter route amounts differ because of fees.
 - **Test durable recovery state.** Run `node --test test/dual-operations.test.js`. It verifies wallet-wide operation serialization and atomic persistence of confirmed transaction evidence with the owned-token ledger.
+- **Test cross-pool recovery gating.** Run `node --test test/dual-deploy-recovery.test.js`. It verifies legacy operations without a `kind`, unrelated candidate pools, pending exits blocking new deploys, other-wallet exclusion, fail-closed recovery errors, recovered-position handling, and the already-held wallet lock path.
 - **Test STRK-USDC valuation.** Run `node --test test/pnl-token-valuation.test.js`. It checks that USDC is priced as USDC, an SOL-quote pair still uses SOL, and an unpriced held token cannot produce a position value. The live manager trigger remains unverified without its VPS decision log.
 - **Test rent and deposit guards.** Run `node --test test/pnl-dual-rent.test.js`. A missing deposit basis or unreadable position rent must leave net PnL and its percentage unavailable. Actual position rent must override the SDK reserve estimate, and recoverable lamports must remain an asset while open.
 - **Test missing position discovery.** Run `node --test test/position-discovery.test.js`. An empty portfolio listing cannot close a position while its account exists or RPC lookup is inconclusive.

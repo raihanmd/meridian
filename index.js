@@ -5,7 +5,7 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { agentLoop } from "./agent.js";
 import { log } from "./logger.js";
-import { getMyPositions, closePosition, getActiveBin } from "./tools/dlmm.js";
+import { getMyPositions, closePosition, getActiveBin, reconcilePendingDualDeploys } from "./tools/dlmm.js";
 import { getWalletBalances } from "./tools/wallet.js";
 import { discoverPools, getTopCandidates } from "./tools/screening.js";
 import { formatAllowlistedPoolDiagnostics, formatConfirmedDeploy, formatDeployFailureNotice, formatDeployRecoveryNotice, formatDryRunDeploy } from "./screening-report.js";
@@ -436,6 +436,37 @@ export async function runScreeningCycle({ silent = false } = {}) {
   log("cron", "Screening cycle triggered");
 
   let observerDiscovery = null;
+  try {
+    const recovery = await reconcilePendingDualDeploys();
+    if (recovery.hadOperations) {
+      const details = recovery.outcomes.map((outcome) => {
+        const identity = `${outcome.operation_id} (${(outcome.pool_address || "unknown pool").slice(0, 8)})`;
+        if (outcome.recovery_pending) return `• ${identity}: recovery pending — ${outcome.error || "chain evidence is incomplete"}`;
+        if (outcome.success && outcome.position) return `• ${identity}: confirmed position ${outcome.position}`;
+        if (outcome.externally_settled) return `• ${identity}: external settlement verified; SOL proceeds/PnL unverified`;
+        if (outcome.recovered) return `• ${identity}: returned to SOL; a fresh screening cycle is required`;
+        return `• ${identity}: reconciliation checked; no new deployment this cycle`;
+      }).join("\n");
+      const report = `Screening paused to reconcile a previous dual-token operation.\n\n${details}\n\nNo new deployment was attempted; screening will resume on the next cycle.`;
+      log("cron", `Screening paused — ${recovery.pending.length} dual-token operation(s) remain pending`);
+      appendDecision({
+        type: "skip",
+        actor: "SCREENER",
+        summary: "Screening paused for dual-token operation recovery",
+        reason: recovery.pending.map((outcome) => `${outcome.operation_id}: ${outcome.error || "reconciliation pending"}`).join("; ") || "A previous operation was reconciled; require a fresh screening cycle",
+      });
+      notifyScreeningSkip(report, silent);
+      _screeningBusy = false;
+      return report;
+    }
+  } catch (error) {
+    log("cron_error", `Screening recovery pre-check failed: ${error.message}`);
+    const report = `Screening paused — prior dual-token deploy recovery could not be verified: ${error.message}. No deployment was attempted.`;
+    notifyScreeningSkip(report, silent);
+    _screeningBusy = false;
+    return report;
+  }
+
   try {
     observerDiscovery = await discoverPools({ page_size: 50 });
     await recordResearchCandidates(observerDiscovery, "screening cycle");

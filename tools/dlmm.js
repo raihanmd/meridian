@@ -51,6 +51,7 @@ import {
   validateSwapOutcome,
 } from "./dual-deploy.js";
 import { dualOperationJournal } from "./dual-operations.js";
+import { reconcilePendingDualDeploys as reconcilePendingDualDeployOperations } from "./dual-deploy-recovery.js";
 import { reconcileExternallySettledDualDeploy, walletDlmmPositionAddresses } from "./dual-deploy-reconciliation.js";
 import { reconcileExternallySettledDualExit } from "./dual-exit-reconciliation.js";
 
@@ -1083,11 +1084,49 @@ async function reconcilePendingDualExits(wallet = getWallet()) {
   }
 }
 
+export async function reconcilePendingDualDeploys(wallet = getWallet(), { alreadyWalletLocked = false } = {}) {
+  const walletAddress = wallet.publicKey.toString();
+  const recovery = await reconcilePendingDualDeployOperations({
+    journal: dualOperationJournal,
+    walletAddress,
+    loadPool: getPool,
+    reconcile: (operation, pool) => reconcileDualOperation(operation, pool, wallet),
+    alreadyWalletLocked,
+  });
+  for (const outcome of recovery.outcomes) {
+    if (outcome.recovery_pending) {
+      log("dual_recovery_pending", `Operation ${outcome.operation_id} (${(outcome.pool_address || "unknown pool").slice(0, 8)}) remains pending: ${outcome.error || "chain evidence is incomplete"}`);
+    } else if (outcome.recovered) {
+      log("dual_recovery", `Operation ${outcome.operation_id} recovered to SOL; a fresh screening cycle is required`);
+    } else if (outcome.externally_settled) {
+      log("dual_recovery_external", `Operation ${outcome.operation_id} externally settled; SOL proceeds and net PnL remain unverified`);
+    } else if (outcome.success && outcome.position) {
+      log("dual_recovery_deploy", `Operation ${outcome.operation_id} reconciled as deployed position ${outcome.position}`);
+    }
+  }
+  return recovery;
+}
+
 async function deployDualTokenPosition(args) {
   const poolAddress = normalizeMint(args.pool_address);
   const wallet = getWallet();
   await reconcilePendingDualExits(wallet);
-  return dualOperationJournal.withPoolLock(poolAddress, wallet.publicKey.toString(), () => deployDualTokenPositionLocked(args));
+  return dualOperationJournal.withPoolLock(poolAddress, wallet.publicKey.toString(), async () => {
+    const recovery = await reconcilePendingDualDeploys(wallet, { alreadyWalletLocked: true });
+    if (recovery.hadOperations) {
+      const deployed = recovery.deployed[0];
+      if (deployed) return { ...deployed, reconciled: true };
+      const pending = recovery.pending[0];
+      return {
+        success: false,
+        recovery_pending: Boolean(pending),
+        recovered: recovery.recovered.length > 0,
+        operation_id: pending?.operation_id || recovery.recovered[0]?.operation_id || recovery.outcomes[0]?.operation_id,
+        error: pending?.error || "Previous dual-token operation was reconciled; start a fresh screening cycle before another deployment",
+      };
+    }
+    return deployDualTokenPositionLocked(args);
+  });
 }
 
 async function deployDualTokenPositionLocked(args) {

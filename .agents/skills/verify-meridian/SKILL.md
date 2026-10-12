@@ -30,7 +30,7 @@ test "$(git rev-parse --show-toplevel)" = "$PWD"
 node --version
 test -d node_modules
 npm test
-node --test test/dual-deploy.test.js test/dual-operations.test.js test/dual-exit-reconciliation.test.js test/dual-ta.test.js test/dual-token-policy.test.js test/pnl-dual-rent.test.js test/pnl-token-valuation.test.js test/position-discovery.test.js test/screening-report.test.js test/range-coverage.test.js test/chart-indicators.test.js test/management-decision.test.js test/pool-memory-reason.test.js
+node --test test/dual-deploy.test.js test/dual-deploy-recovery.test.js test/dual-operations.test.js test/dual-exit-reconciliation.test.js test/dual-ta.test.js test/dual-token-policy.test.js test/pnl-dual-rent.test.js test/pnl-token-valuation.test.js test/position-discovery.test.js test/screening-report.test.js test/range-coverage.test.js test/chart-indicators.test.js test/management-decision.test.js test/pool-memory-reason.test.js
 git diff --check
 ```
 
