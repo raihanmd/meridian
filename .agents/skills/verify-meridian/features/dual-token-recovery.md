@@ -20,7 +20,7 @@ Dual-token deployment converts a SOL budget into both DLMM pool tokens, then add
 
 ## How to get to it (user POV)
 
-- Enable `strategy.dualToken.enabled` in `user-config.json` and reach an eligible pair through automated screening.
+- Enable `dualTokenEnabled` in `user-config.json` and reach an eligible pair through automated screening.
 - Observe the plan and deploy/recovery reports in Telegram.
 - For code verification, run the scoped dual-deploy and dual-operations tests. Do not trigger recovery by submitting or replaying transactions on the operator's wallet.
 
@@ -40,6 +40,7 @@ Preconditions:
 - **Test rent and deposit guards.** Run `node --test test/pnl-dual-rent.test.js`. A missing deposit basis or unreadable position rent must leave net PnL and its percentage unavailable. Actual position rent must override the SDK reserve estimate, and recoverable lamports must remain an asset while open.
 - **Test missing position discovery.** Run `node --test test/position-discovery.test.js`. An empty portfolio listing cannot close a position while its account exists or RPC lookup is inconclusive.
 - **Test Telegram report.** Run the screening report suite from Doctor and inspect that `DEPLOY RECOVERY` differentiates recovered from pending state. This validates formatting logic, not delivery to a live Telegram chat.
+- **Test range coverage.** Run `node --test test/range-coverage.test.js test/screening-report.test.js`. Both normal and reconciled deploy results should derive downside/upside coverage from persisted bin prices; a legacy plan without enough prices reports unavailable coverage without blocking reconciliation.
 - **Live recovery proof.** Only in the isolated environment, capture both signatures, confirmed transaction deltas, position/rent state, and the final report. Verify existing token inventory before and after. If the signature or owner/mint delta cannot be verified, Meridian must remain pending; do not mark it recovered.
 
 ## Gotchas

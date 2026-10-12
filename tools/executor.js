@@ -638,7 +638,7 @@ export async function executeTool(name, args) {
           pair: result.pool_name || args.pool_name || args.pool_address?.slice(0, 8),
           amountSol: result.amount_sol ?? args.amount_y ?? args.amount_sol ?? 0,
           position: result.position,
-          tx: result.txs?.[0] ?? result.tx,
+          tx: result.txs?.at(-1) ?? result.tx,
           txs: result.txs,
           priceRange: result.price_range,
           rangeCoverage: result.range_coverage,

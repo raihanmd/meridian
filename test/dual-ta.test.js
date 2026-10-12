@@ -82,6 +82,9 @@ test("selects bounded active-bin-centered ranges and produces deterministic Spot
   assert.ok(meanReverting.minBinId < meanReverting.activeBin && meanReverting.maxBinId > meanReverting.activeBin);
   assert.ok(meanReverting.binsBelow >= 5 && meanReverting.binsAbove >= 5);
   assert.deepEqual(analyze({ candles: candles({ start: 1, noise: 0.015 }) }), meanReverting);
+  assert.equal(meanReverting.latestCandleEndAt, new Date(now * 1000).toISOString());
+  assert.equal(meanReverting.candleAgeSeconds, 0);
+  assert.ok(meanReverting.distanceToOneHourHighPct >= 0);
 });
 
 test("widens with observed volatility and biases bins toward a sustained trend", () => {

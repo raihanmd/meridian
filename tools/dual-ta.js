@@ -175,6 +175,9 @@ export function analyzeDualTokenRange({
     oneHour: candleWindowMetrics(oneHour),
     sixHour: candleWindowMetrics(sixHour),
   };
+  const latestCandleEndSeconds = latest.timestamp + FIFTEEN_MINUTES_SECONDS;
+  const distanceToOneHourHighPct = ((metrics.oneHour.high - latest.close) / metrics.oneHour.high) * 100;
+  const distanceToSixHourHighPct = ((metrics.sixHour.high - latest.close) / metrics.sixHour.high) * 100;
   const trend = metrics.sixHour.netChangePct / 100;
   const trendBias = Math.tanh(trend * 8) * maxDirectionalBias;
   const targetWidthPct = metrics.sixHour.rangePct * volatilityMultiplier;
@@ -195,6 +198,10 @@ export function analyzeDualTokenRange({
     minBinId: activeBin - binsBelow,
     maxBinId: activeBin + binsAbove,
     metrics,
+    latestCandleEndAt: new Date(latestCandleEndSeconds * 1000).toISOString(),
+    candleAgeSeconds: Math.max(0, nowSeconds - latestCandleEndSeconds),
+    distanceToOneHourHighPct,
+    distanceToSixHourHighPct,
     rationale: `TA: ${metrics.sixHour.samples} fresh 15m candles; 6h range ${metrics.sixHour.rangePct.toFixed(2)}%, trend ${metrics.sixHour.netChangePct.toFixed(2)}%, directional efficiency ${metrics.sixHour.directionalEfficiency.toFixed(2)}; ${strategy} distribution over ${totalBins} bins.`,
   };
 }

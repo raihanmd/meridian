@@ -1,3 +1,63 @@
+function decimal(value, digits = 2) {
+  const number = Number(value);
+  return value == null || !Number.isFinite(number) ? "?" : number.toFixed(digits);
+}
+
+function price(value) {
+  const number = Number(value);
+  return value == null || !Number.isFinite(number) ? "?" : number.toPrecision(7);
+}
+
+export function formatEntryEvidence(ta, indicator) {
+  const lines = [];
+  if (ta?.eligible) {
+    lines.push(`TA: ${ta.strategy} | 1h ${decimal(ta.metrics?.oneHour?.netChangePct)}% | 6h ${decimal(ta.metrics?.sixHour?.netChangePct)}%`);
+    lines.push(`Distance from completed-candle high: 1h ${decimal(ta.distanceToOneHourHighPct)}% | 6h ${decimal(ta.distanceToSixHourHighPct)}%`);
+    lines.push(`Last complete 15m candle ended: ${ta.latestCandleEndAt || "?"} | age ${decimal(ta.candleAgeSeconds, 0)}s`);
+  }
+  if (indicator?.enabled) {
+    const status = indicator.skipped ? "SKIPPED" : indicator.confirmed ? "CONFIRMED" : "REJECTED";
+    lines.push(`Indicator: ${status} · ${indicator.preset || "?"} · ${indicator.reason || "no reason"}`);
+    if (indicator.intervals?.length) {
+      lines.push(`Intervals: ${indicator.intervals.map((entry) => `${entry.interval} ${entry.ok ? entry.confirmed ? "pass" : "reject" : "unavailable"}`).join(", ")}`);
+    }
+  } else if (indicator == null) {
+    lines.push("Indicator: no screening confirmation recorded");
+  } else {
+    lines.push("Indicator: disabled");
+  }
+  return lines;
+}
+
+export function formatConfirmedDeploy(result, { candidate = null, agentNarrative = "" } = {}) {
+  if (!result?.success || !result.position) throw new Error("Expected a confirmed position result");
+  const coverage = result.range_coverage;
+  const ta = result.ta_evidence || candidate?.dual_ta;
+  const indicator = candidate?.indicator_confirmation;
+  const narrative = String(agentNarrative || "").replace(/\s+/g, " ").trim().slice(0, 420);
+  return [
+    "🚀 DEPLOYED",
+    "",
+    result.pool_name || candidate?.name || result.pool || "unknown pool",
+    result.pool || candidate?.pool || "unknown address",
+    `Position: ${result.position}`,
+    result.txs?.length ? `Liquidity tx: ${result.txs.at(-1)}` : null,
+    "",
+    `◎ ${decimal(result.amount_sol ?? result.amount_y, 4)} SOL | ${result.strategy || "?"} | bin ${result.bin_range?.active ?? "?"}`,
+    `Range: ${price(result.price_range?.min)} → ${price(result.price_range?.max)}`,
+    coverage
+      ? `Range cover: ${decimal(coverage.downside_pct)}% downside | ${decimal(coverage.upside_pct)}% upside | ${decimal(coverage.width_pct)}% total`
+      : "Range cover: unavailable in confirmed tool result",
+    result.dual_token ? `Deposited tokens: X ${decimal(result.amount_x, 6)} | Y ${decimal(result.amount_y, 6)}` : null,
+    `Execution fees: ${decimal(result.transaction_fees_sol, 6)} SOL | position rent estimate: ${decimal(result.rent_estimate_sol, 6)} SOL`,
+    "",
+    "ENTRY EVIDENCE",
+    ...formatEntryEvidence(ta, indicator),
+    candidate ? `Screening snapshot: fee/active TVL ${decimal(candidate.fee_active_tvl_ratio, 4)}% | volume $${decimal(candidate.volume_window, 0)} | TVL $${decimal(candidate.tvl, 0)} | organic ${decimal(candidate.organic_score, 0)}` : null,
+    narrative ? `Agent assessment (unverified): ${narrative}` : null,
+  ].filter((line) => line != null).join("\n");
+}
+
 export function formatDryRunDeploy(result, candidates = []) {
   const plan = result?.would_deploy;
   if (!result?.dry_run || !plan) throw new Error("Expected a simulated deploy result");
@@ -12,11 +72,15 @@ export function formatDryRunDeploy(result, candidates = []) {
     plan.dual_token
       ? `Strategy: ${plan.strategy} | range: ${plan.min_bin_id}–${plan.max_bin_id} | active bin: ${plan.active_bin}`
       : `Strategy: ${plan.strategy} | bins below: ${plan.bins_below} | bins above: ${plan.bins_above}`,
+    plan.range_coverage
+      ? `Range cover: ${decimal(plan.range_coverage.downside_pct)}% downside | ${decimal(plan.range_coverage.upside_pct)}% upside | ${decimal(plan.range_coverage.width_pct)}% total`
+      : null,
     ...(plan.dual_token ? [
       `Tokens: ${plan.token_x_mint} / ${plan.token_y_mint}`,
       `SOL reserve: ${plan.reserve_sol} SOL (position rent estimate ${plan.position_rent_estimate_sol} SOL; temporary-account budget ${plan.ata_rent_budget_sol} SOL)`,
       ...plan.swaps.map((swap) => `Swap ${swap.side.toUpperCase()}: ${swap.inputSol} SOL → ${swap.outputMint} | quoted min output ${swap.quote.min_out_amount} | impact ${swap.quote.price_impact_pct}%`),
       `TA: ${plan.ta.rationale}`,
+      ...formatEntryEvidence(plan.ta, pool?.indicator_confirmation),
     ] : []),
     "Agent selected this pool for a simulated entry. No transaction was sent and no position was created.",
   ].join("\n");
