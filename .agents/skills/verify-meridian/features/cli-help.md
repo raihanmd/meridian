@@ -19,7 +19,7 @@ Preconditions:
 
 - Doctor passes.
 - Run from the repository root.
-- No `.env`, wallet, RPC, Telegram, or model key is required for this command.
+- Use a clean disposable checkout without the production `.env` for proof. `envcrypt.js` loads repository environment configuration before CLI help runs; encrypted entries can require `ENVRYPT_KEY`.
 
 - **Show help.** Run `.agents/skills/verify-meridian/scripts/verify-cli-help.sh`. Exit code is `0`; captured stdout includes the Meridian command reference and the `screen`, `deploy`, `close`, and `candidates` entries.
 - **Verify generated help state.** The helper confirms `$HOME/.meridian/SKILL.md` exists inside its temporary home and preserves a copy in its evidence directory.
@@ -28,4 +28,6 @@ Preconditions:
 ## Gotchas
 
 - `cli.js` generates `~/.meridian/SKILL.md` even for help. Always use the helper or an isolated `HOME` when validating this behavior.
+- Isolating `HOME` does not isolate a repository `.env`. The helper must run from a checkout without production secrets.
+- The CLI help says `--silent` suppresses Telegram; research-observation notifications are an exception in the current implementation.
 - Do not infer that trade commands are safe because help prints a `--dry-run` option. They have separate read, quote, and wallet requirements.

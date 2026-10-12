@@ -11,6 +11,7 @@
 import fs from "fs";
 import { log } from "./logger.js";
 import { repoPath } from "./repo-root.js";
+import { isLowYieldEligible } from "./management-decision.js";
 
 const STATE_FILE = repoPath("state.json");
 
@@ -463,13 +464,7 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
 
   // ── Low yield (only after position has had time to accumulate fees) ───
   const { age_minutes } = positionData;
-  const minAgeForYieldCheck = mgmtConfig.minAgeBeforeYieldCheck ?? 60;
-  if (
-    fee_per_tvl_24h != null &&
-    mgmtConfig.minFeePerTvl24h != null &&
-    fee_per_tvl_24h < mgmtConfig.minFeePerTvl24h &&
-    (age_minutes == null || age_minutes >= minAgeForYieldCheck)
-  ) {
+  if (isLowYieldEligible(positionData, mgmtConfig)) {
     return {
       action: "LOW_YIELD",
       reason: `Low yield: fee/TVL ${fee_per_tvl_24h.toFixed(2)}% < min ${mgmtConfig.minFeePerTvl24h}% (age: ${age_minutes ?? "?"}m)`,

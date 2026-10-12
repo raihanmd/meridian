@@ -230,6 +230,7 @@ export async function confirmIndicatorPreset({
   preset = side === "entry" ? config.indicators.entryPreset : config.indicators.exitPreset,
   intervals = config.indicators.intervals,
   refresh = false,
+  fetchIndicators = fetchChartIndicatorsForMint,
 } = {}) {
   if (!config.indicators.enabled || !mint || !preset) {
     return { enabled: false, confirmed: true, reason: "Indicators disabled or not configured", intervals: [] };
@@ -243,7 +244,7 @@ export async function confirmIndicatorPreset({
   const results = [];
   for (const interval of targets) {
     try {
-      const payload = await fetchChartIndicatorsForMint(mint, { interval, refresh });
+      const payload = await fetchIndicators(mint, { interval, refresh });
       const evaluation = evaluatePreset(side, preset, payload);
       results.push({
         interval,

@@ -8,7 +8,7 @@ import { log } from "./logger.js";
 import { getMyPositions, closePosition, getActiveBin } from "./tools/dlmm.js";
 import { getWalletBalances } from "./tools/wallet.js";
 import { discoverPools, getTopCandidates } from "./tools/screening.js";
-import { formatAllowlistedPoolDiagnostics, formatDryRunDeploy } from "./screening-report.js";
+import { formatAllowlistedPoolDiagnostics, formatConfirmedDeploy, formatDryRunDeploy } from "./screening-report.js";
 import { getDualPoolRestrictionReason, getPoolAllowlistDisplay, getPoolRestrictionReason } from "./token-allowlist.js";
 import { DEFAULT_RESEARCH_DIR, enqueueResearchCandidates } from "./research/queue.js";
 import { startBackgroundResearchWorker } from "./research/worker.js";
@@ -38,6 +38,7 @@ import { stageSignals } from "./signal-tracker.js";
 import { getWeightsSummary } from "./signal-weights.js";
 import { bootstrapHiveMind, ensureAgentId, getHiveMindPullMode, isHiveMindEnabled, pullHiveMindLessons, pullHiveMindPresets, registerHiveMindAgent, startHiveMindBackgroundSync } from "./hivemind.js";
 import { appendDecision } from "./decision-log.js";
+import { formatStayReason, getDeterministicCloseRule } from "./management-decision.js";
 
 import { REPO_ROOT, repoPath } from "./repo-root.js";
 
@@ -250,6 +251,7 @@ export async function runManagementCycle({ silent = false } = {}) {
 
     // JS trailing TP check
     const exitMap = new Map();
+    const pendingTrailingMap = new Map();
     for (const p of positionData) {
       if (
         !p.pnl_pct_suspicious &&
@@ -264,6 +266,7 @@ export async function runManagementCycle({ silent = false } = {}) {
           if (queueTrailingDropConfirmation(p.position, exit.peak_pnl_pct, exit.current_pnl_pct, config.management.trailingDropPct)) {
             scheduleTrailingDropConfirmation(p.position);
           }
+          pendingTrailingMap.set(p.position, exit.reason);
           continue;
         }
         exitMap.set(p.position, exit.reason);
@@ -286,7 +289,7 @@ export async function runManagementCycle({ silent = false } = {}) {
         continue;
       }
 
-      const closeRule = getDeterministicCloseRule(p, config.management);
+      const closeRule = getDeterministicCloseRule(p, config.management, getTrackedPosition(p.position));
       if (closeRule) {
         actionMap.set(p.position, closeRule);
         continue;
@@ -308,12 +311,16 @@ export async function runManagementCycle({ silent = false } = {}) {
       const inRange = p.in_range ? "🟢 IN" : `🔴 OOR ${p.minutes_out_of_range ?? 0}m`;
       const val = config.management.solMode ? `◎${p.total_value_usd ?? "?"}` : `$${p.total_value_usd ?? "?"}`;
       const unclaimed = config.management.solMode ? `◎${p.unclaimed_fees_usd ?? "?"}` : `$${p.unclaimed_fees_usd ?? "?"}`;
-      const statusLabel = act.action === "INSTRUCTION" ? "HOLD (instruction)" : act.action;
+      const statusLabel = act.action === "INSTRUCTION" ? "HOLD (instruction)" : act.action === "STAY" ? "HOLD" : act.action;
       let line = `**${p.pair}** | Age: ${p.age_minutes ?? "?"}m | Val: ${val} | Unclaimed: ${unclaimed} | PnL: ${p.pnl_pct ?? "?"}% | Yield: ${p.fee_per_tvl_24h ?? "?"}% | ${inRange} | ${statusLabel}`;
       if (p.instruction) line += `\nNote: "${p.instruction}"`;
       if (act.action === "CLOSE" && act.rule === "exit") line += `\n⚡ Trailing TP: ${act.reason}`;
       if (act.action === "CLOSE" && act.rule && act.rule !== "exit") line += `\nRule ${act.rule}: ${act.reason}`;
       if (act.action === "CLAIM") line += `\n→ Claiming fees`;
+      if (act.action === "STAY") {
+        line += `\nHOLD reason: ${formatStayReason(p, config.management, getTrackedPosition(p.position))}`;
+        if (pendingTrailingMap.has(p.position)) line += `; trailing exit awaiting fresh PnL confirmation (${pendingTrailingMap.get(p.position)})`;
+      }
       return line;
     });
 
@@ -641,6 +648,8 @@ export async function runScreeningCycle({ silent = false } = {}) {
         `  smart_wallets: ${sw?.in_pool?.length ?? 0} present${sw?.in_pool?.length ? ` → CONFIDENCE BOOST (${sw.in_pool.map(w => w.name).join(", ")})` : ""}`,
         activeBin != null ? `  active_bin: ${activeBin}` : null,
         pool.dual_ta ? `  dual_ta: ${pool.dual_ta.strategy} | bins ${pool.dual_ta.minBinId}→${pool.dual_ta.maxBinId} | 6h range ${pool.dual_ta.metrics.sixHour.rangePct.toFixed(2)}% | trend ${pool.dual_ta.metrics.sixHour.netChangePct.toFixed(2)}%` : null,
+        pool.dual_ta ? `  entry_candle_end: ${pool.dual_ta.latestCandleEndAt} | 1h high distance ${pool.dual_ta.distanceToOneHourHighPct.toFixed(2)}% | 6h high distance ${pool.dual_ta.distanceToSixHourHighPct.toFixed(2)}%` : null,
+        pool.indicator_confirmation ? `  indicator: ${pool.indicator_confirmation.skipped ? "skipped" : pool.indicator_confirmation.confirmed ? "confirmed" : "rejected"} | ${pool.indicator_confirmation.preset || "?"} | ${pool.indicator_confirmation.reason}` : null,
         priceChange != null ? `  1h: price${priceChange >= 0 ? "+" : ""}${priceChange}%, net_buyers=${netBuyers ?? "?"}` : null,
         n?.narrative ? `  narrative_untrusted: ${sanitizeUntrustedPromptText(n.narrative, 500)}` : `  narrative_untrusted: none`,
         mem ? `  memory_untrusted: ${sanitizeUntrustedPromptText(mem, 500)}` : null,
@@ -670,6 +679,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
     let deployAttempted = false;
     let deploySucceeded = false;
     let simulatedDeploy = null;
+    let confirmedDeploy = null;
     let deployRecovery = null;
     const { content } = await agentLoop(`
 SCREENING CYCLE
@@ -745,8 +755,11 @@ IMPORTANT:
         onToolFinish: async ({ name, result, success }) => {
           if (name === "deploy_position") {
             deployAttempted = true;
-            deploySucceeded = Boolean(success && result?.success !== false && !result?.error && !result?.blocked);
-            if (deploySucceeded && result?.dry_run) simulatedDeploy = result;
+            if (success && (result?.dry_run || result?.position) && result?.success !== false && !result?.error && !result?.blocked) {
+              deploySucceeded = true;
+              if (result?.dry_run) simulatedDeploy = result;
+              else if (result?.position) confirmedDeploy = result;
+            }
             if (result?.recovery_pending || result?.recovered) {
               deployRecovery = {
                 pending: Boolean(result.recovery_pending),
@@ -758,7 +771,39 @@ IMPORTANT:
           await liveMessage?.toolFinish(name, result, success);
         },
       });
-    screenReport = simulatedDeploy ? formatDryRunDeploy(simulatedDeploy, passing.map(({ pool }) => pool)) : content;
+    const confirmedCandidate = confirmedDeploy
+      ? passing.find(({ pool }) => pool.pool === confirmedDeploy.pool)?.pool
+      : null;
+    const agentNarrative = stripThink(content).split(/WHY THIS WON\s*/i)[1]?.split(/\n\s*(?:REJECTED|DEPLOY RECOVERY)\b/i)[0] || "";
+    screenReport = simulatedDeploy
+      ? formatDryRunDeploy(simulatedDeploy, passing.map(({ pool }) => pool))
+      : confirmedDeploy
+        ? formatConfirmedDeploy(confirmedDeploy, { candidate: confirmedCandidate, agentNarrative })
+        : content;
+    if (confirmedDeploy) {
+      try { appendDecision({
+        type: "deploy_evidence",
+        actor: "SCREENER",
+        pool: confirmedDeploy.pool,
+        pool_name: confirmedDeploy.pool_name || confirmedCandidate?.name,
+        position: confirmedDeploy.position,
+        summary: "Confirmed deploy; deterministic entry evidence recorded",
+        reason: agentNarrative || "Agent selected from screened candidates",
+        metrics: {
+          rangeCoverage: confirmedDeploy.range_coverage ?? null,
+          ta: confirmedDeploy.ta_evidence ?? confirmedCandidate?.dual_ta ?? null,
+          indicator: confirmedCandidate?.indicator_confirmation ?? null,
+          screeningSnapshot: confirmedCandidate ? {
+            feeActiveTvlRatio: confirmedCandidate.fee_active_tvl_ratio,
+            volumeWindow: confirmedCandidate.volume_window,
+            tvl: confirmedCandidate.tvl,
+            organicScore: confirmedCandidate.organic_score,
+          } : null,
+        },
+      }); } catch (error) {
+        log("decision_log_warn", `Confirmed deploy ${confirmedDeploy.position} could not be logged: ${error.message}`);
+      }
+    }
     if (!deploySucceeded && /^\s*(?:🚀\s*DEPLOYED|🧪\s*DRY RUN\s*·\s*WOULD DEPLOY)/i.test(screenReport)) {
       screenReport = "⛔ NO DEPLOY\n\nThe agent reported a deploy, but no successful deploy_position result was recorded. Check bot logs.";
     }
@@ -877,7 +922,7 @@ Summarize the current portfolio health, total fees earned, and performance of al
           }
           break;
         }
-        const closeRule = getDeterministicCloseRule(p, config.management);
+        const closeRule = getDeterministicCloseRule(p, config.management, getTrackedPosition(p.position));
         if (closeRule) {
           const cooldownMs = config.schedule.managementIntervalMin * 60 * 1000;
           const sinceLastTrigger = Date.now() - _pollTriggeredAt;
@@ -977,51 +1022,6 @@ function formatCandidates(candidates, filteredExamples = []) {
   });
 
   return lines.join("\n");
-}
-
-function getDeterministicCloseRule(position, managementConfig) {
-  const tracked = getTrackedPosition(position.position);
-  const pnlSuspect = (() => {
-    // Couldn't-price-this-tick flag (e.g. Jupiter outage) — never act on PnL rules.
-    if (position.pnl_pct_suspicious) return true;
-    if (position.pnl_pct == null) return false;
-    if (position.pnl_pct > -90) return false;
-    if (tracked?.amount_sol && (position.total_value_usd ?? 0) > 0.01) {
-      log("cron_warn", `Suspect PnL for ${position.pair}: ${position.pnl_pct}% but position still has value — skipping PnL rules`);
-      return true;
-    }
-    return false;
-  })();
-
-  if (!pnlSuspect && position.pnl_pct != null && position.pnl_pct <= managementConfig.stopLossPct) {
-    return { action: "CLOSE", rule: 1, reason: "stop loss" };
-  }
-  if (!pnlSuspect && position.pnl_pct != null && position.pnl_pct >= managementConfig.takeProfitPct) {
-    return { action: "CLOSE", rule: 2, reason: "take profit" };
-  }
-  if (
-    position.active_bin != null &&
-    position.upper_bin != null &&
-    position.active_bin > position.upper_bin + managementConfig.outOfRangeBinsToClose
-  ) {
-    return { action: "CLOSE", rule: 3, reason: "pumped far above range" };
-  }
-  if (
-    position.active_bin != null &&
-    position.upper_bin != null &&
-    position.active_bin > position.upper_bin &&
-    (position.minutes_out_of_range ?? 0) >= managementConfig.outOfRangeWaitMinutes
-  ) {
-    return { action: "CLOSE", rule: 4, reason: "OOR" };
-  }
-  if (
-    position.fee_per_tvl_24h != null &&
-    position.fee_per_tvl_24h < managementConfig.minFeePerTvl24h &&
-    (position.age_minutes ?? 0) >= 60
-  ) {
-    return { action: "CLOSE", rule: 5, reason: "low yield" };
-  }
-  return null;
 }
 
 // ═══════════════════════════════════════════

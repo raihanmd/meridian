@@ -35,6 +35,7 @@ import { computePositions, fetchDlmmPnlForPool, getSolUsdPrice } from "./pnl.js"
 import { verifyMissingPositions } from "./position-discovery.js";
 import { getDualPoolRestrictionReason, getPoolRestrictionReason } from "../token-allowlist.js";
 import { analyzeDualTokenRange, fetchDualTokenOhlcv } from "./dual-ta.js";
+import { computePriceRangeCoverage } from "../range-coverage.js";
 import {
   addOperationTokenDelta,
   buildDualDeployPlan,
@@ -500,6 +501,14 @@ async function signedTransactionStillValid(signedTransaction) {
 
 async function finalizeDualPosition(operation, pool, wallet) {
   const plan = operation.plan;
+  let rangeCoverage = plan.range_coverage ?? null;
+  if (!rangeCoverage) {
+    try {
+      rangeCoverage = computePriceRangeCoverage({ min: plan.price_range?.min, max: plan.price_range?.max, active: plan.active_price });
+    } catch {
+      log("dual_recovery_warn", `Operation ${operation.id} has no reconstructable range coverage; position reconciliation will continue`);
+    }
+  }
   const xRaw = operation.amountXRaw ?? operation.acquiredRaw?.x;
   const yRaw = operation.amountYRaw ?? operation.acquiredRaw?.y;
   const decimalsX = operation.tokenDecimals?.x;
@@ -538,12 +547,13 @@ async function finalizeDualPosition(operation, pool, wallet) {
     success: true, dual_token: true, position: operation.positionAddress, pool: operation.poolAddress,
     pool_name: plan.pool_name, strategy: plan.strategy,
     bin_range: { min: plan.min_bin_id, max: plan.max_bin_id, active: plan.active_bin },
-    price_range: plan.price_range, amount_sol: plan.amount_sol,
+    price_range: plan.price_range, range_coverage: rangeCoverage, amount_sol: plan.amount_sol,
     token_x_mint: plan.token_x_mint, token_y_mint: plan.token_y_mint,
     amount_x: Number(xRaw) / 10 ** decimalsX, amount_y: Number(yRaw) / 10 ** decimalsY,
     txs: [...Object.values(operation.swapResults || {}).map((result) => result.tx).filter(Boolean), operation.positionSignature],
     rent_estimate_sol: operation.positionRentSol, reserve_sol: operation.reserveSol,
-    transaction_fees_sol: transactionFeesSol, fee_accounting_complete: transactionFeesSol != null, ta: plan.ta.metrics,
+    transaction_fees_sol: transactionFeesSol, fee_accounting_complete: transactionFeesSol != null,
+    ta: plan.ta?.metrics ?? null, ta_evidence: plan.ta ?? null,
   };
 }
 
@@ -1061,6 +1071,7 @@ async function deployDualTokenPositionLocked(args) {
   const minPrice = Number(getPriceOfBinByBinId(minBinId, binStep).toString());
   const maxPrice = Number(getPriceOfBinByBinId(maxBinId, binStep).toString());
   const activePrice = Number(getPriceOfBinByBinId(active.binId, binStep).toString());
+  const rangeCoverage = computePriceRangeCoverage({ min: minPrice, max: maxPrice, active: activePrice });
   const deployPlan = {
     pool_address: poolAddress,
     pool_name: args.pool_name || poolAddress.slice(0, 8),
@@ -1075,6 +1086,7 @@ async function deployDualTokenPositionLocked(args) {
     active_bin: active.binId,
     active_price: activePrice,
     price_range: { min: minPrice, max: maxPrice },
+    range_coverage: rangeCoverage,
     amount_sol: requestedBudget,
     x_value_share: valueSplit.xValueShare,
     y_value_share: valueSplit.yValueShare,
@@ -1268,11 +1280,11 @@ async function deployDualTokenPositionLocked(args) {
     return {
       success: true, dual_token: true, position: newPosition.publicKey.toString(), pool: poolAddress,
       pool_name: args.pool_name, strategy: ta.strategy, bin_range: { min: minBinId, max: maxBinId, active: active.binId },
-      price_range: { min: minPrice, max: maxPrice }, amount_sol: requestedBudget,
+      price_range: { min: minPrice, max: maxPrice }, range_coverage: rangeCoverage, amount_sol: requestedBudget,
       token_x_mint: mintX, token_y_mint: mintY, amount_x: Number(xLamports.toString()) / 10 ** decimalsX,
       amount_y: Number(yLamports.toString()) / 10 ** decimalsY,
       txs: [...Object.values(swapResults).map((result) => result.tx).filter(Boolean), signature],
-      rent_estimate_sol: positionRentSol, reserve_sol: reserveSol, ta: ta.metrics,
+      rent_estimate_sol: positionRentSol, reserve_sol: reserveSol, ta: ta.metrics, ta_evidence: ta,
       transaction_fees_sol: operation.transactionFeesSol,
     };
   } catch (error) {

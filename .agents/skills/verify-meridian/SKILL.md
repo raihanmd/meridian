@@ -11,7 +11,7 @@ Use this skill to check Meridian through its user-facing CLI and to validate the
 
 Meridian has no local web server. Its user surfaces are the one-shot Node CLI, an interactive terminal agent, and a long-running Telegram bot. The CLI needs no persistent process for read-only help. Run commands from the repository root with Node 18 or newer.
 
-For the isolated CLI proof, launch the app through its CLI entry point with a temporary home directory so its generated `~/.meridian/SKILL.md` cannot touch the operator's home:
+For the isolated CLI proof, use a clean checkout without a production `.env` and a temporary home directory so its generated `~/.meridian/SKILL.md` cannot touch the operator's home:
 
 ```bash
 .agents/skills/verify-meridian/scripts/verify-cli-help.sh
@@ -30,7 +30,7 @@ test "$(git rev-parse --show-toplevel)" = "$PWD"
 node --version
 test -d node_modules
 npm test
-node --test test/dual-deploy.test.js test/dual-operations.test.js test/dual-ta.test.js test/dual-token-policy.test.js test/pnl-dual-rent.test.js test/pnl-token-valuation.test.js test/position-discovery.test.js test/screening-report.test.js
+node --test test/dual-deploy.test.js test/dual-operations.test.js test/dual-ta.test.js test/dual-token-policy.test.js test/pnl-dual-rent.test.js test/pnl-token-valuation.test.js test/position-discovery.test.js test/screening-report.test.js test/range-coverage.test.js test/chart-indicators.test.js test/management-decision.test.js test/pool-memory-reason.test.js
 git diff --check
 ```
 
@@ -38,7 +38,7 @@ Require Node 18+, the expected repo root, successful syntax checks, passing focu
 
 ## Drive
 
-Use `.agents/skills/verify-meridian/scripts/verify-cli-help.sh` as the no-network, no-wallet CLI entry proof. Use `node cli.js candidates --limit 3` only when API access is configured and the wallet has no pending dual exit: candidate enrichment looks up positions and can resume exit swaps. For Telegram, use `/status`, `/config`, `/candidates`, and `/screen` only on the operator's authorized bot after checking for pending dual exits; `/screen` refreshes the deterministic candidate list in Telegram.
+Use `.agents/skills/verify-meridian/scripts/verify-cli-help.sh` as the no-network, no-wallet CLI entry proof from a clean checkout. Isolating `HOME` does not isolate repository `.env` loading. Use `node cli.js candidates --limit 3` only when API access is configured and the wallet has no pending dual exit: candidate enrichment looks up positions and can resume exit swaps. For Telegram, use `/status`, `/config`, `/candidates`, and `/screen` only on the operator's authorized bot after checking for pending dual exits; `/screen` refreshes the deterministic candidate list in Telegram.
 
 Never use `/deploy`, `node cli.js deploy`, `node cli.js swap`, `/close`, or `node cli.js close` for verification. They can sign real transactions when live mode is active.
 

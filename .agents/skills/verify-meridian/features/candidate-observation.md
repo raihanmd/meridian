@@ -4,7 +4,7 @@ Candidate observation refreshes pool data and displays which pools pass configur
 
 ## Sub-features
 
-- `candidates-cli` fetches and enriches a limited candidate list in the CLI.
+- `candidates-cli` runs the screened shortlist, including allowlist, dual-token TA, and optional chart indicator checks.
 - `candidates-telegram` refreshes the current discovery page from Telegram.
 - `candidate-labels` distinguishes allowlisted base tokens from a deployable pair.
 
@@ -22,7 +22,7 @@ Preconditions:
 - Meteora discovery access is reachable. CLI enrichment may also call RPC and token data APIs.
 - For Telegram, this is the operator's existing authorized bot and there is no competing poller. Inspect `dual-operations.json` first; position lookup can resume a pending dual exit and send token-to-SOL swaps.
 
-- **CLI observation.** Run `node cli.js candidates --limit 3`. Exit code `0` returns JSON with `candidates` and `total_screened`; each returned candidate has its pool address and configured metrics.
+- **CLI shortlist.** Run `node cli.js candidates --limit 3`. Exit code `0` returns JSON with `candidates` and `total_screened`; the candidates have passed the current screening checks. This is narrower than the Telegram discovery observation page.
 - **Telegram observation.** Send `/candidates`. The bot returns the current discovery page with observation/allowlist labels and pair restrictions.
 - **Proof.** Save the command or Telegram action and response. Confirm a displayed allowlisted base pair is not described as deploy-ready unless the pair-level guard passes.
 
@@ -30,5 +30,6 @@ Preconditions:
 
 - This path uses external APIs and can fail from rate limits or unavailable providers.
 - A candidate on the observation list may fail allowlist, pair, or entry checks later.
+- Optional chart confirmation may be confirmed, rejected, or skipped when its API is unavailable. Skipped confirmation currently allows the candidate through; the confirmed auto-deploy report records that distinction.
 - A Telegram response from a different bot process is not proof for the process under test.
 - Candidate enrichment calls position lookup. Do not drive this path against a wallet with a pending dual exit merely to verify the candidate display.
